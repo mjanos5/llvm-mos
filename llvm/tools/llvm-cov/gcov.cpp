@@ -19,11 +19,10 @@
 #include <system_error>
 using namespace llvm;
 
-static void reportCoverage(StringRef SourceFile, StringRef ObjectDir,
-                           const std::string &InputGCNO,
-                           const std::string &InputGCDA, bool DumpGCOV,
-                           const GCOV::Options &Options) {
+static SmallString<128> createCoverageFileStem(StringRef &SourceFile,
+                                               const StringRef &ObjectDir) {
   SmallString<128> CoverageFileStem(ObjectDir);
+
   if (CoverageFileStem.empty()) {
     // If no directory was specified with -o, look next to the source file.
     CoverageFileStem = sys::path::parent_path(SourceFile);
@@ -35,45 +34,81 @@ static void reportCoverage(StringRef SourceFile, StringRef ObjectDir,
     // A file was given. Ignore the source file and look next to this file.
     sys::path::replace_extension(CoverageFileStem, "");
 
-  std::string GCNO = InputGCNO.empty()
-                         ? std::string(CoverageFileStem.str()) + ".gcno"
-                         : InputGCNO;
-  std::string GCDA = InputGCDA.empty()
-                         ? std::string(CoverageFileStem.str()) + ".gcda"
-                         : InputGCDA;
-  GCOVFile GF;
+  return CoverageFileStem;
+}
 
+static std::string createInputFileName(const SmallString<128> &CoverageFileStem,
+                                    const std::string &InputGCFileName,
+                                    const char *extensionSuffix) {
+  return InputGCFileName.empty()
+             ? std::string(CoverageFileStem.str()) + ".gc" + extensionSuffix
+             : InputGCFileName;
+}
+
+static void reportGCOVFileNameError(const std::string &GCOVFileName,
+                                    const std::error_code &EC) {
+  errs() << GCOVFileName << ": " << EC.message() << "\n";
+}
+
+static ErrorOr<std::unique_ptr<MemoryBuffer>>
+getGCOVFileOrSTDIN(const std::string &GCOVFileName) {
   // Open .gcda and .gcda without requiring a NUL terminator. The concurrent
   // modification may nullify the NUL terminator condition.
-  ErrorOr<std::unique_ptr<MemoryBuffer>> GCNO_Buff =
-      MemoryBuffer::getFileOrSTDIN(GCNO, /*IsText=*/false,
-                                   /*RequiresNullTerminator=*/false);
-  if (std::error_code EC = GCNO_Buff.getError()) {
-    errs() << GCNO << ": " << EC.message() << "\n";
-    return;
-  }
+
+  return MemoryBuffer::getFileOrSTDIN(GCOVFileName, false, false);
+}
+
+static bool validateGCNOFile(ErrorOr<std::unique_ptr<MemoryBuffer>> &GCNO_Buff,
+                             GCOVFile &GF) {
   GCOVBuffer GCNO_GB(GCNO_Buff.get().get());
   if (!GF.readGCNO(GCNO_GB)) {
     errs() << "Invalid .gcno File!\n";
+    return false;
+  }
+
+  return true;
+}
+
+static void
+validateGCDAFile(GCOVFile &GF, const std::string &GCDA,
+                       ErrorOr<std::unique_ptr<MemoryBuffer>> &GCDA_Buff) {
+  GCOVBuffer gcda_buf(GCDA_Buff.get().get());
+  if (!gcda_buf.readGCDAFormat())
+    errs() << GCDA << ":not a gcov data file\n";
+  else if (!GF.readGCDA(gcda_buf))
+    errs() << "Invalid .gcda File!\n";
+}
+
+static void reportCoverage(StringRef SourceFile, StringRef ObjectDir,
+                           const std::string &InputGCNO,
+                           const std::string &InputGCDA, bool DumpGCOV,
+                           const GCOV::Options &Options) {
+  GCOVFile GF;
+  SmallString<128> CoverageFileStem =
+      createCoverageFileStem(SourceFile, ObjectDir);
+
+  std::string GCNO = createInputFileName(CoverageFileStem, InputGCNO, "no");
+  ErrorOr<std::unique_ptr<MemoryBuffer>> GCNO_Buff = getGCOVFileOrSTDIN(GCNO);
+  if (std::error_code EC = GCNO_Buff.getError()) {
+    reportGCOVFileNameError(GCNO, EC);
     return;
   }
 
-  ErrorOr<std::unique_ptr<MemoryBuffer>> GCDA_Buff =
-      MemoryBuffer::getFileOrSTDIN(GCDA, /*IsText=*/false,
-                                   /*RequiresNullTerminator=*/false);
+  if (!validateGCNOFile(GCNO_Buff, GF))
+    return;
+
+  std::string GCDA = createInputFileName(CoverageFileStem, InputGCDA, "da");
+  ErrorOr<std::unique_ptr<MemoryBuffer>> GCDA_Buff = getGCOVFileOrSTDIN(GCDA);
   if (std::error_code EC = GCDA_Buff.getError()) {
     if (EC != errc::no_such_file_or_directory) {
-      errs() << GCDA << ": " << EC.message() << "\n";
+      reportGCOVFileNameError(GCDA, EC);
       return;
     }
+
     // Clear the filename to make it clear we didn't read anything.
     GCDA = "-";
   } else {
-    GCOVBuffer gcda_buf(GCDA_Buff.get().get());
-    if (!gcda_buf.readGCDAFormat())
-      errs() << GCDA << ":not a gcov data file\n";
-    else if (!GF.readGCDA(gcda_buf))
-      errs() << "Invalid .gcda File!\n";
+    validateGCDAFile(GF, GCDA, GCDA_Buff);
   }
 
   if (DumpGCOV)
