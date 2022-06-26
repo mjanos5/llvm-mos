@@ -88,7 +88,7 @@ public:
       : StopInfo(thread, break_id), m_should_stop(false),
         m_should_stop_is_valid(false), m_should_perform_action(true),
         m_address(LLDB_INVALID_ADDRESS), m_break_id(LLDB_INVALID_BREAK_ID),
-        m_was_one_shot(false) {
+        m_was_all_internal(false), m_was_one_shot(false) {
     StoreBPInfo();
   }
 
@@ -96,7 +96,7 @@ public:
       : StopInfo(thread, break_id), m_should_stop(should_stop),
         m_should_stop_is_valid(true), m_should_perform_action(true),
         m_address(LLDB_INVALID_ADDRESS), m_break_id(LLDB_INVALID_BREAK_ID),
-        m_was_one_shot(false) {
+        m_was_all_internal(false), m_was_one_shot(false) {
     StoreBPInfo();
   }
 
@@ -108,11 +108,22 @@ public:
       BreakpointSiteSP bp_site_sp(
           thread_sp->GetProcess()->GetBreakpointSiteList().FindByID(m_value));
       if (bp_site_sp) {
-        if (bp_site_sp->GetNumberOfOwners() == 1) {
+        uint32_t num_owners = bp_site_sp->GetNumberOfOwners();
+        if (num_owners == 1) {
           BreakpointLocationSP bp_loc_sp = bp_site_sp->GetOwnerAtIndex(0);
           if (bp_loc_sp) {
-            m_break_id = bp_loc_sp->GetBreakpoint().GetID();
-            m_was_one_shot = bp_loc_sp->GetBreakpoint().IsOneShot();
+            Breakpoint & bkpt = bp_loc_sp->GetBreakpoint();
+            m_break_id = bkpt.GetID();
+            m_was_one_shot = bkpt.IsOneShot();
+            m_was_all_internal = bkpt.IsInternal();
+          }
+        } else {
+          m_was_all_internal = true;
+          for (uint32_t i = 0; i < num_owners; i++) {
+            if (!bp_site_sp->GetOwnerAtIndex(i)->GetBreakpoint().IsInternal()) {
+              m_was_all_internal = false;
+              break;
+            }
           }
         }
         m_address = bp_site_sp->GetLoadAddress();
@@ -163,23 +174,7 @@ public:
   }
 
   bool DoShouldNotify(Event *event_ptr) override {
-    ThreadSP thread_sp(m_thread_wp.lock());
-    if (thread_sp) {
-      BreakpointSiteSP bp_site_sp(
-          thread_sp->GetProcess()->GetBreakpointSiteList().FindByID(m_value));
-      if (bp_site_sp) {
-        bool all_internal = true;
-
-        for (uint32_t i = 0; i < bp_site_sp->GetNumberOfOwners(); i++) {
-          if (!bp_site_sp->GetOwnerAtIndex(i)->GetBreakpoint().IsInternal()) {
-            all_internal = false;
-            break;
-          }
-        }
-        return !all_internal;
-      }
-    }
-    return true;
+    return !m_was_all_internal;
   }
 
   const char *GetDescription() override {
@@ -376,9 +371,10 @@ protected:
                       "StopInfoBreakpoint::PerformAction - in expression, "
                       "continuing: %s.",
                       m_should_stop ? "true" : "false");
-            process->GetTarget().GetDebugger().GetAsyncOutputStream()->Printf(
-                "Warning: hit breakpoint while running function, skipping "
-                "commands and conditions to prevent recursion.\n");
+            Debugger::ReportWarning(
+                "hit breakpoint while running function, skipping commands and "
+                "conditions to prevent recursion",
+                process->GetTarget().GetDebugger().GetID());
             return;
           }
 
@@ -450,21 +446,20 @@ protected:
                   bp_loc_sp->ConditionSaysStop(exe_ctx, condition_error);
 
               if (!condition_error.Success()) {
-                Debugger &debugger = exe_ctx.GetTargetRef().GetDebugger();
-                StreamSP error_sp = debugger.GetAsyncErrorStream();
-                error_sp->Printf("Stopped due to an error evaluating condition "
-                                 "of breakpoint ");
-                bp_loc_sp->GetDescription(error_sp.get(),
-                                          eDescriptionLevelBrief);
-                error_sp->Printf(": \"%s\"", bp_loc_sp->GetConditionText());
-                error_sp->EOL();
                 const char *err_str =
-                    condition_error.AsCString("<Unknown Error>");
+                    condition_error.AsCString("<unknown error>");
                 LLDB_LOGF(log, "Error evaluating condition: \"%s\"\n", err_str);
 
-                error_sp->PutCString(err_str);
-                error_sp->EOL();
-                error_sp->Flush();
+                StreamString strm;
+                strm << "stopped due to an error evaluating condition of "
+                        "breakpoint ";
+                bp_loc_sp->GetDescription(&strm, eDescriptionLevelBrief);
+                strm << ": \"" << bp_loc_sp->GetConditionText() << "\"\n";
+                strm << err_str;
+
+                Debugger::ReportError(
+                    strm.GetString().str(),
+                    exe_ctx.GetTargetRef().GetDebugger().GetID());
               } else {
                 LLDB_LOGF(log,
                           "Condition evaluated for breakpoint %s on thread "
@@ -603,6 +598,7 @@ private:
   // in case somebody deletes it between the time the StopInfo is made and the
   // description is asked for.
   lldb::break_id_t m_break_id;
+  bool m_was_all_internal;
   bool m_was_one_shot;
 };
 
@@ -656,8 +652,7 @@ public:
 
   StopInfoWatchpoint(Thread &thread, break_id_t watch_id,
                      lldb::addr_t watch_hit_addr)
-      : StopInfo(thread, watch_id), m_should_stop(false),
-        m_should_stop_is_valid(false), m_watch_hit_addr(watch_hit_addr) {}
+      : StopInfo(thread, watch_id), m_watch_hit_addr(watch_hit_addr) {}
 
   ~StopInfoWatchpoint() override = default;
 
@@ -860,20 +855,18 @@ protected:
               }
             }
           } else {
-            StreamSP error_sp = debugger.GetAsyncErrorStream();
-            error_sp->Printf(
-                "Stopped due to an error evaluating condition of watchpoint ");
-            wp_sp->GetDescription(error_sp.get(), eDescriptionLevelBrief);
-            error_sp->Printf(": \"%s\"", wp_sp->GetConditionText());
-            error_sp->EOL();
-            const char *err_str = error.AsCString("<Unknown Error>");
+            const char *err_str = error.AsCString("<unknown error>");
             LLDB_LOGF(log, "Error evaluating condition: \"%s\"\n", err_str);
 
-            error_sp->PutCString(err_str);
-            error_sp->EOL();
-            error_sp->Flush();
-            // If the condition fails to be parsed or run, we should stop.
-            m_should_stop = true;
+            StreamString strm;
+            strm << "stopped due to an error evaluating condition of "
+                    "watchpoint ";
+            wp_sp->GetDescription(&strm, eDescriptionLevelBrief);
+            strm << ": \"" << wp_sp->GetConditionText() << "\"\n";
+            strm << err_str;
+
+            Debugger::ReportError(strm.GetString().str(),
+                                  exe_ctx.GetTargetRef().GetDebugger().GetID());
           }
         }
 
@@ -931,8 +924,8 @@ protected:
   }
 
 private:
-  bool m_should_stop;
-  bool m_should_stop_is_valid;
+  bool m_should_stop = false;
+  bool m_should_stop_is_valid = false;
   lldb::addr_t m_watch_hit_addr;
 };
 
@@ -1122,8 +1115,7 @@ private:
 
 class StopInfoExec : public StopInfo {
 public:
-  StopInfoExec(Thread &thread)
-      : StopInfo(thread, LLDB_INVALID_UID), m_performed_action(false) {}
+  StopInfoExec(Thread &thread) : StopInfo(thread, LLDB_INVALID_UID) {}
 
   ~StopInfoExec() override = default;
 
@@ -1149,7 +1141,7 @@ protected:
       thread_sp->GetProcess()->DidExec();
   }
 
-  bool m_performed_action;
+  bool m_performed_action = false;
 };
 
 // StopInfoFork
@@ -1157,8 +1149,8 @@ protected:
 class StopInfoFork : public StopInfo {
 public:
   StopInfoFork(Thread &thread, lldb::pid_t child_pid, lldb::tid_t child_tid)
-      : StopInfo(thread, child_pid), m_performed_action(false),
-        m_child_pid(child_pid), m_child_tid(child_tid) {}
+      : StopInfo(thread, child_pid), m_child_pid(child_pid),
+        m_child_tid(child_tid) {}
 
   ~StopInfoFork() override = default;
 
@@ -1179,7 +1171,7 @@ protected:
       thread_sp->GetProcess()->DidFork(m_child_pid, m_child_tid);
   }
 
-  bool m_performed_action;
+  bool m_performed_action = false;
 
 private:
   lldb::pid_t m_child_pid;
@@ -1191,8 +1183,8 @@ private:
 class StopInfoVFork : public StopInfo {
 public:
   StopInfoVFork(Thread &thread, lldb::pid_t child_pid, lldb::tid_t child_tid)
-      : StopInfo(thread, child_pid), m_performed_action(false),
-        m_child_pid(child_pid), m_child_tid(child_tid) {}
+      : StopInfo(thread, child_pid), m_child_pid(child_pid),
+        m_child_tid(child_tid) {}
 
   ~StopInfoVFork() override = default;
 
@@ -1213,7 +1205,7 @@ protected:
       thread_sp->GetProcess()->DidVFork(m_child_pid, m_child_tid);
   }
 
-  bool m_performed_action;
+  bool m_performed_action = false;
 
 private:
   lldb::pid_t m_child_pid;
@@ -1224,8 +1216,7 @@ private:
 
 class StopInfoVForkDone : public StopInfo {
 public:
-  StopInfoVForkDone(Thread &thread)
-      : StopInfo(thread, 0), m_performed_action(false) {}
+  StopInfoVForkDone(Thread &thread) : StopInfo(thread, 0) {}
 
   ~StopInfoVForkDone() override = default;
 
@@ -1246,7 +1237,7 @@ protected:
       thread_sp->GetProcess()->DidVForkDone();
   }
 
-  bool m_performed_action;
+  bool m_performed_action = false;
 };
 
 } // namespace lldb_private

@@ -42,10 +42,10 @@
 ///
 //===----------------------------------------------------------------------===//
 
+
 #ifndef LLVM_ANALYSIS_CALLGRAPH_H
 #define LLVM_ANALYSIS_CALLGRAPH_H
 
-#include "llvm/ADT/GraphTraits.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/PassManager.h"
@@ -59,6 +59,7 @@
 
 namespace llvm {
 
+template <class GraphType> struct GraphTraits;
 class CallGraphNode;
 class Function;
 class Module;
@@ -85,6 +86,10 @@ class CallGraph {
   /// This node has edges to it from all functions making indirect calls
   /// or calling an external function.
   std::unique_ptr<CallGraphNode> CallsExternalNode;
+
+  /// This node has edges to if from all functions that call external NoCallback
+  /// functions. These edges are in lieu of edges to CallsExternalNode.
+  std::unique_ptr<CallGraphNode> NoCallbackNode;
 
 public:
   explicit CallGraph(Module &M);
@@ -128,6 +133,10 @@ public:
 
   CallGraphNode *getCallsExternalNode() const {
     return CallsExternalNode.get();
+  }
+
+  CallGraphNode *getNoCallbackNode() const {
+    return NoCallbackNode.get();
   }
 
   /// Old node has been deleted, and New is to be used in its place, update the

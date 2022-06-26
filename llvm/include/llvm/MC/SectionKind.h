@@ -24,6 +24,10 @@ class SectionKind {
     /// Metadata - Debug info sections or other metadata.
     Metadata,
 
+    /// Exclude - This section will be excluded from the final executable or
+    /// shared library. Only valid for ELF / COFF targets.
+    Exclude,
+
     /// Text - Text section, used for functions and other executable code.
     Text,
 
@@ -98,6 +102,8 @@ class SectionKind {
                /// BSSExtern - This is BSS data with normal external linkage.
                BSSExtern,
 
+           NoInit,
+
            /// Common - Data with common linkage.  These represent tentative
            /// definitions, which always have a zero initializer and are never
            /// marked 'constant'.
@@ -117,6 +123,8 @@ class SectionKind {
 public:
 
   bool isMetadata() const { return K == Metadata; }
+
+  bool isExclude() const { return K == Exclude; }
 
   bool isText() const { return K == Text || K == ExecuteOnly; }
 
@@ -157,12 +165,15 @@ public:
   bool isThreadBSSLocal() const { return K == ThreadBSSLocal; }
 
   bool isGlobalWriteableData() const {
-    return isBSS() || isCommon() || isData() || isReadOnlyWithRel();
+    return isBSS() || isNoInit() || isCommon() || isData() ||
+           isReadOnlyWithRel();
   }
 
   bool isBSS() const { return K == BSS || K == BSSLocal || K == BSSExtern; }
   bool isBSSLocal() const { return K == BSSLocal; }
   bool isBSSExtern() const { return K == BSSExtern; }
+
+  bool isNoInit() const { return K == NoInit; }
 
   bool isCommon() const { return K == Common; }
 
@@ -180,6 +191,7 @@ private:
 public:
 
   static SectionKind getMetadata() { return get(Metadata); }
+  static SectionKind getExclude() { return get(Exclude); }
   static SectionKind getText() { return get(Text); }
   static SectionKind getExecuteOnly() { return get(ExecuteOnly); }
   static SectionKind getReadOnly() { return get(ReadOnly); }
@@ -202,6 +214,7 @@ public:
   static SectionKind getBSS() { return get(BSS); }
   static SectionKind getBSSLocal() { return get(BSSLocal); }
   static SectionKind getBSSExtern() { return get(BSSExtern); }
+  static SectionKind getNoInit() { return get(NoInit); }
   static SectionKind getCommon() { return get(Common); }
   static SectionKind getData() { return get(Data); }
   static SectionKind getReadOnlyWithRel() { return get(ReadOnlyWithRel); }

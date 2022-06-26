@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #ifndef LLVM_CODEGEN_TARGETINSTRINFO_H
 #define LLVM_CODEGEN_TARGETINSTRINFO_H
 
@@ -734,12 +735,16 @@ public:
     virtual bool shouldIgnoreForPipelining(const MachineInstr *MI) const = 0;
 
     /// Create a condition to determine if the trip count of the loop is greater
-    /// than TC.
+    /// than TC, where TC is always one more than for the previous prologue or
+    /// 0 if this is being called for the outermost prologue.
     ///
     /// If the trip count is statically known to be greater than TC, return
     /// true. If the trip count is statically known to be not greater than TC,
     /// return false. Otherwise return nullopt and fill out Cond with the test
     /// condition.
+    ///
+    /// Note: This hook is guaranteed to be called from the innermost to the
+    /// outermost prologue of the loop being software pipelined.
     virtual Optional<bool>
     createTripCountGreaterCondition(int TC, MachineBasicBlock &MBB,
                                     SmallVectorImpl<MachineOperand> &Cond) = 0;
@@ -1119,6 +1124,11 @@ public:
                                   MachineInstr &LoadMI,
                                   LiveIntervals *LIS = nullptr) const;
 
+  // If the COPY instruction in MI can be folded to a stack operation, return
+  // the register class to use.
+  virtual const TargetRegisterClass *canFoldCopy(const MachineInstr &MI,
+                                                 unsigned FoldIdx) const;
+
   /// Return true when there is potentially a faster code sequence
   /// for an instruction chain ending in \p Root. All potential patterns are
   /// returned in the \p Pattern vector. Pattern should be sorted in priority
@@ -1279,13 +1289,6 @@ protected:
   }
 
 public:
-  /// getAddressSpaceForPseudoSourceKind - Given the kind of memory
-  /// (e.g. stack) the target returns the corresponding address space.
-  virtual unsigned
-  getAddressSpaceForPseudoSourceKind(unsigned Kind) const {
-    return 0;
-  }
-
   /// unfoldMemoryOperand - Separate a single instruction which folded a load or
   /// a store or a load and a store into two or more instruction. If this is
   /// possible, returns true as well as the new instructions by reference.
@@ -1953,7 +1956,7 @@ public:
   virtual MachineBasicBlock::iterator
   insertOutlinedCall(Module &M, MachineBasicBlock &MBB,
                      MachineBasicBlock::iterator &It, MachineFunction &MF,
-                     const outliner::Candidate &C) const {
+                     outliner::Candidate &C) const {
     llvm_unreachable(
         "Target didn't implement TargetInstrInfo::insertOutlinedCall!");
   }
@@ -2005,6 +2008,10 @@ public:
   /// Returns the callee operand from the given \p MI.
   virtual const MachineOperand &getCalleeOperand(const MachineInstr &MI) const {
     return MI.getOperand(0);
+  }
+
+  virtual bool shouldOverlapInterval(const MachineInstr &MI) const {
+    return true;
   }
 
 private:

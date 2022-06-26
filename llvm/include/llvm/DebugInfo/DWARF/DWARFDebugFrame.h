@@ -13,7 +13,6 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/iterator.h"
-#include "llvm/DebugInfo/DWARF/DWARFDataExtractor.h"
 #include "llvm/DebugInfo/DWARF/DWARFExpression.h"
 #include "llvm/Support/Error.h"
 #include <map>
@@ -23,6 +22,9 @@
 namespace llvm {
 
 class raw_ostream;
+class DWARFDataExtractor;
+class MCRegisterInfo;
+struct DIDumpOptions;
 
 namespace dwarf {
 
@@ -130,7 +132,7 @@ public:
   uint32_t getRegister() const { return RegNum; }
   int32_t getOffset() const { return Offset; }
   uint32_t getAddressSpace() const {
-    assert(Kind == RegPlusOffset && AddrSpace.hasValue());
+    assert(Kind == RegPlusOffset && AddrSpace);
     return *AddrSpace;
   }
   int32_t getConstant() const { return Offset; }

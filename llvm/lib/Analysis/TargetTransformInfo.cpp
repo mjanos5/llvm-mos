@@ -11,7 +11,6 @@
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/TargetTransformInfoImpl.h"
 #include "llvm/IR/CFG.h"
-#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
@@ -21,7 +20,6 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/ErrorHandling.h"
 #include <utility>
 
 using namespace llvm;
@@ -32,6 +30,11 @@ using namespace PatternMatch;
 static cl::opt<bool> EnableReduxCost("costmodel-reduxcost", cl::init(false),
                                      cl::Hidden,
                                      cl::desc("Recognize reduction patterns."));
+
+static cl::opt<unsigned> CacheLineSize(
+    "cache-line-size", cl::init(0), cl::Hidden,
+    cl::desc("Use this to override the target cache line size when "
+             "specified by the user."));
 
 namespace {
 /// No-op implementation of the TTI interface using the utility base
@@ -350,7 +353,19 @@ bool TargetTransformInfo::isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV,
                                         Scale, AddrSpace, I);
 }
 
-bool TargetTransformInfo::isLSRCostLess(LSRCost &C1, LSRCost &C2) const {
+bool TargetTransformInfo::isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV,
+                                                int64_t BaseOffset,
+                                                bool HasBaseReg, Type *BaseType,
+                                                int64_t Scale, Type *ScaleType,
+                                                unsigned AddrSpace,
+                                                Instruction *I) const {
+  return TTIImpl->isLegalAddressingMode(Ty, BaseGV, BaseOffset, HasBaseReg,
+                                        BaseType, Scale, ScaleType, AddrSpace,
+                                        I);
+}
+
+bool TargetTransformInfo::isLSRCostLess(const LSRCost &C1,
+                                        const LSRCost &C2) const {
   return TTIImpl->isLSRCostLess(C1, C2);
 }
 
@@ -396,6 +411,11 @@ bool TargetTransformInfo::isLegalNTStore(Type *DataType,
 
 bool TargetTransformInfo::isLegalNTLoad(Type *DataType, Align Alignment) const {
   return TTIImpl->isLegalNTLoad(DataType, Alignment);
+}
+
+bool TargetTransformInfo::isLegalBroadcastLoad(Type *ElementTy,
+                                               ElementCount NumElements) const {
+  return TTIImpl->isLegalBroadcastLoad(ElementTy, NumElements);
 }
 
 bool TargetTransformInfo::isLegalMaskedGather(Type *DataType,
@@ -452,12 +472,26 @@ InstructionCost TargetTransformInfo::getScalingFactorCost(
   return Cost;
 }
 
+InstructionCost TargetTransformInfo::getScalingFactorCost(
+    Type *Ty, GlobalValue *BaseGV, int64_t BaseOffset, bool HasBaseReg,
+    Type *BaseType, int64_t Scale, Type *ScaleType, unsigned AddrSpace) const {
+  InstructionCost Cost =
+      TTIImpl->getScalingFactorCost(Ty, BaseGV, BaseOffset, HasBaseReg,
+                                    BaseType, Scale, ScaleType, AddrSpace);
+  assert(Cost >= 0 && "TTI should not produce negative costs!");
+  return Cost;
+}
+
 bool TargetTransformInfo::LSRWithInstrQueries() const {
   return TTIImpl->LSRWithInstrQueries();
 }
 
 bool TargetTransformInfo::isTruncateFree(Type *Ty1, Type *Ty2) const {
   return TTIImpl->isTruncateFree(Ty1, Ty2);
+}
+
+bool TargetTransformInfo::isZExtFree(Type *Ty1, Type *Ty2) const {
+  return TTIImpl->isZExtFree(Ty1, Ty2);
 }
 
 bool TargetTransformInfo::isProfitableToHoist(Instruction *I) const {
@@ -470,7 +504,7 @@ bool TargetTransformInfo::isTypeLegal(Type *Ty) const {
   return TTIImpl->isTypeLegal(Ty);
 }
 
-InstructionCost TargetTransformInfo::getRegUsageForType(Type *Ty) const {
+unsigned TargetTransformInfo::getRegUsageForType(Type *Ty) const {
   return TTIImpl->getRegUsageForType(Ty);
 }
 
@@ -623,8 +657,9 @@ Optional<unsigned> TargetTransformInfo::getVScaleForTuning() const {
   return TTIImpl->getVScaleForTuning();
 }
 
-bool TargetTransformInfo::shouldMaximizeVectorBandwidth() const {
-  return TTIImpl->shouldMaximizeVectorBandwidth();
+bool TargetTransformInfo::shouldMaximizeVectorBandwidth(
+    TargetTransformInfo::RegisterKind K) const {
+  return TTIImpl->shouldMaximizeVectorBandwidth(K);
 }
 
 ElementCount TargetTransformInfo::getMinimumVF(unsigned ElemWidth,
@@ -637,6 +672,11 @@ unsigned TargetTransformInfo::getMaximumVF(unsigned ElemWidth,
   return TTIImpl->getMaximumVF(ElemWidth, Opcode);
 }
 
+unsigned TargetTransformInfo::getStoreMinimumVF(unsigned VF, Type *ScalarMemTy,
+                                                Type *ScalarValTy) const {
+  return TTIImpl->getStoreMinimumVF(VF, ScalarMemTy, ScalarValTy);
+}
+
 bool TargetTransformInfo::shouldConsiderAddressTypePromotion(
     const Instruction &I, bool &AllowPromotionWithoutCommonHeader) const {
   return TTIImpl->shouldConsiderAddressTypePromotion(
@@ -644,7 +684,8 @@ bool TargetTransformInfo::shouldConsiderAddressTypePromotion(
 }
 
 unsigned TargetTransformInfo::getCacheLineSize() const {
-  return TTIImpl->getCacheLineSize();
+  return CacheLineSize.getNumOccurrences() > 0 ? CacheLineSize
+                                               : TTIImpl->getCacheLineSize();
 }
 
 llvm::Optional<unsigned>
@@ -742,12 +783,11 @@ InstructionCost TargetTransformInfo::getArithmeticInstrCost(
   return Cost;
 }
 
-InstructionCost TargetTransformInfo::getShuffleCost(ShuffleKind Kind,
-                                                    VectorType *Ty,
-                                                    ArrayRef<int> Mask,
-                                                    int Index,
-                                                    VectorType *SubTp) const {
-  InstructionCost Cost = TTIImpl->getShuffleCost(Kind, Ty, Mask, Index, SubTp);
+InstructionCost TargetTransformInfo::getShuffleCost(
+    ShuffleKind Kind, VectorType *Ty, ArrayRef<int> Mask, int Index,
+    VectorType *SubTp, ArrayRef<const Value *> Args) const {
+  InstructionCost Cost =
+      TTIImpl->getShuffleCost(Kind, Ty, Mask, Index, SubTp, Args);
   assert(Cost >= 0 && "TTI should not produce negative costs!");
   return Cost;
 }
@@ -973,18 +1013,21 @@ Value *TargetTransformInfo::getOrCreateResultFromMemIntrinsic(
 
 Type *TargetTransformInfo::getMemcpyLoopLoweringType(
     LLVMContext &Context, Value *Length, unsigned SrcAddrSpace,
-    unsigned DestAddrSpace, unsigned SrcAlign, unsigned DestAlign) const {
+    unsigned DestAddrSpace, unsigned SrcAlign, unsigned DestAlign,
+    Optional<uint32_t> AtomicElementSize) const {
   return TTIImpl->getMemcpyLoopLoweringType(Context, Length, SrcAddrSpace,
-                                            DestAddrSpace, SrcAlign, DestAlign);
+                                            DestAddrSpace, SrcAlign, DestAlign,
+                                            AtomicElementSize);
 }
 
 void TargetTransformInfo::getMemcpyLoopResidualLoweringType(
     SmallVectorImpl<Type *> &OpsOut, LLVMContext &Context,
     unsigned RemainingBytes, unsigned SrcAddrSpace, unsigned DestAddrSpace,
-    unsigned SrcAlign, unsigned DestAlign) const {
-  TTIImpl->getMemcpyLoopResidualLoweringType(OpsOut, Context, RemainingBytes,
-                                             SrcAddrSpace, DestAddrSpace,
-                                             SrcAlign, DestAlign);
+    unsigned SrcAlign, unsigned DestAlign,
+    Optional<uint32_t> AtomicCpySize) const {
+  TTIImpl->getMemcpyLoopResidualLoweringType(
+      OpsOut, Context, RemainingBytes, SrcAddrSpace, DestAddrSpace, SrcAlign,
+      DestAlign, AtomicCpySize);
 }
 
 bool TargetTransformInfo::areInlineCompatible(const Function *Caller,
@@ -1068,6 +1111,10 @@ bool TargetTransformInfo::preferPredicatedReductionSelect(
 TargetTransformInfo::VPLegalization
 TargetTransformInfo::getVPLegalizationStrategy(const VPIntrinsic &VPI) const {
   return TTIImpl->getVPLegalizationStrategy(VPI);
+}
+
+bool TargetTransformInfo::allowIllegalIntegerIV() const {
+  return TTIImpl->allowIllegalIntegerIV();
 }
 
 bool TargetTransformInfo::shouldExpandReduction(const IntrinsicInst *II) const {

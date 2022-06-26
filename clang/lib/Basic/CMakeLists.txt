@@ -1,3 +1,5 @@
+# Modified by Daniel Thornburgh (mysterymath@gmail.com).
+
 set(LLVM_LINK_COMPONENTS
   Support
   )
@@ -75,10 +77,13 @@ add_clang_library(clangBasic
   Targets/ARM.cpp
   Targets/AVR.cpp
   Targets/BPF.cpp
+  Targets/CSKY.cpp
+  Targets/DirectX.cpp
   Targets/Hexagon.cpp
   Targets/Lanai.cpp
   Targets/Le64.cpp
   Targets/M68k.cpp
+  Targets/MOS.cpp
   Targets/MSP430.cpp
   Targets/Mips.cpp
   Targets/NVPTX.cpp

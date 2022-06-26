@@ -32,6 +32,7 @@ class InputSectionBase;
 class OutputSection;
 class SectionBase;
 class ThunkSection;
+struct OutputDesc;
 
 // This represents an r-value in the linker script.
 struct ExprValue {
@@ -75,7 +76,8 @@ enum SectionsCommandKind {
   AssignmentKind, // . = expr or <sym> = expr
   OutputSectionKind,
   InputSectionKind,
-  ByteKind    // BYTE(expr), SHORT(expr), LONG(expr) or QUAD(expr)
+  ByteKind,    // BYTE(expr), SHORT(expr), LONG(expr) or QUAD(expr)
+  MemoryRegionKind,
 };
 
 struct SectionCommand {
@@ -239,6 +241,22 @@ struct ByteCommand : SectionCommand {
   unsigned size;
 };
 
+// Include a LMA memory region in a custom output format.
+struct MemoryRegionCommand : SectionCommand {
+  MemoryRegionCommand(MemoryRegion *memRegion, bool full)
+      : SectionCommand(MemoryRegionKind), memRegion(memRegion), full(full) {}
+
+  static bool classof(const SectionCommand *c) {
+    return c->kind == MemoryRegionKind;
+  }
+
+  MemoryRegion *memRegion;
+
+  // Whether the entire memory region or only the portion up to the last byte
+  // covered by an output LMA should be inserted.
+  bool full;
+};
+
 struct InsertCommand {
   SmallVector<StringRef, 0> names;
   bool isAfter;
@@ -267,8 +285,7 @@ class LinkerScript final {
     uint64_t tbssAddr = 0;
   };
 
-  llvm::DenseMap<llvm::CachedHashStringRef, OutputSection *>
-      nameToOutputSection;
+  llvm::DenseMap<llvm::CachedHashStringRef, OutputDesc *> nameToOutputSection;
 
   void addSymbol(SymbolAssignment *cmd);
   void assignSymbol(SymbolAssignment *cmd, bool inSec);
@@ -304,8 +321,8 @@ class LinkerScript final {
   uint64_t dot;
 
 public:
-  OutputSection *createOutputSection(StringRef name, StringRef location);
-  OutputSection *getOrCreateOutputSection(StringRef name);
+  OutputDesc *createOutputSection(StringRef name, StringRef location);
+  OutputDesc *getOrCreateOutputSection(StringRef name);
 
   bool hasPhdrsCommands() { return !phdrsCommands.empty(); }
   uint64_t getDot() { return dot; }
@@ -357,10 +374,12 @@ public:
   SmallVector<InsertCommand, 0> insertCommands;
 
   // OutputSections specified by OVERWRITE_SECTIONS.
-  SmallVector<OutputSection *, 0> overwriteSections;
+  SmallVector<OutputDesc *, 0> overwriteSections;
 
   // Sections that will be warned/errored by --orphan-handling.
   SmallVector<const InputSectionBase *, 0> orphanSections;
+
+  SmallVector<SectionCommand *, 0> outputFormat;
 };
 
 extern std::unique_ptr<LinkerScript> script;

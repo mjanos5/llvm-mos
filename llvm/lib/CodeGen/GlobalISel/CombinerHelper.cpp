@@ -5,10 +5,11 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+
 #include "llvm/CodeGen/GlobalISel/CombinerHelper.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallBitVector.h"
-#include "llvm/CodeGen/GlobalISel/Combiner.h"
 #include "llvm/CodeGen/GlobalISel/GISelChangeObserver.h"
 #include "llvm/CodeGen/GlobalISel/GISelKnownBits.h"
 #include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
@@ -16,23 +17,22 @@
 #include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
 #include "llvm/CodeGen/GlobalISel/MIPatternMatch.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
-#include "llvm/CodeGen/GlobalISel/RegisterBankInfo.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/LowLevelType.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/RegisterBankInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
-#include "llvm/Target/TargetMachine.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/DivisionByConstantInfo.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Target/TargetMachine.h"
 #include <tuple>
 
 #define DEBUG_TYPE "gi-combiner"
@@ -2645,6 +2645,9 @@ bool CombinerHelper::matchHoistLogicOpWithSameOpcodeHands(
   Register Y = RightHandInst->getOperand(1).getReg();
   LLT XTy = MRI.getType(X);
   LLT YTy = MRI.getType(Y);
+  // Hand may be a copy of a physical register.
+  if (!X.isVirtual() || !Y.isVirtual())
+    return false;
   if (XTy != YTy)
     return false;
   if (!isLegalOrBeforeLegalizer({LogicOpcode, {XTy, YTy}}))
@@ -2947,7 +2950,7 @@ bool CombinerHelper::matchNotCmp(MachineInstr &MI,
   int64_t Cst;
   if (Ty.isVector()) {
     MachineInstr *CstDef = MRI.getVRegDef(CstReg);
-    auto MaybeCst = getBuildVectorConstantSplat(*CstDef, MRI);
+    auto MaybeCst = getIConstantSplatSExtVal(*CstDef, MRI);
     if (!MaybeCst)
       return false;
     if (!isConstValidTrue(TLI, Ty.getScalarSizeInBits(), *MaybeCst, true, IsFP))
@@ -3467,7 +3470,7 @@ bool CombinerHelper::matchLoadOrCombine(
   // BSWAP.
   bool IsBigEndianTarget = MF.getDataLayout().isBigEndian();
   Optional<bool> IsBigEndian = isBigEndian(MemOffset2Idx, LowestIdx);
-  if (!IsBigEndian.hasValue())
+  if (!IsBigEndian)
     return false;
   bool NeedsBSwap = IsBigEndianTarget != *IsBigEndian;
   if (NeedsBSwap && !isLegalOrBeforeLegalizer({TargetOpcode::G_BSWAP, {Ty}}))
@@ -4031,10 +4034,9 @@ bool CombinerHelper::matchOrShiftToFunnelShift(MachineInstr &MI,
 
   // Given constants C0 and C1 such that C0 + C1 is bit-width:
   // (or (shl x, C0), (lshr y, C1)) -> (fshl x, y, C0) or (fshr x, y, C1)
-  // TODO: Match constant splat.
   int64_t CstShlAmt, CstLShrAmt;
-  if (mi_match(ShlAmt, MRI, m_ICst(CstShlAmt)) &&
-      mi_match(LShrAmt, MRI, m_ICst(CstLShrAmt)) &&
+  if (mi_match(ShlAmt, MRI, m_ICstOrSplat(CstShlAmt)) &&
+      mi_match(LShrAmt, MRI, m_ICstOrSplat(CstLShrAmt)) &&
       CstShlAmt + CstLShrAmt == BitWidth) {
     FshOpc = TargetOpcode::G_FSHR;
     Amt = LShrAmt;
@@ -4085,7 +4087,7 @@ void CombinerHelper::applyFunnelShiftToRotate(MachineInstr &MI) {
   Observer.changingInstr(MI);
   MI.setDesc(Builder.getTII().get(IsFSHL ? TargetOpcode::G_ROTL
                                          : TargetOpcode::G_ROTR));
-  MI.RemoveOperand(2);
+  MI.removeOperand(2);
   Observer.changedInstr(MI);
 }
 
@@ -4227,18 +4229,23 @@ bool CombinerHelper::matchAndOrDisjointMask(
     return false;
 
   Register Src;
-  int64_t MaskAnd;
-  int64_t MaskOr;
+  Register AndMaskReg;
+  int64_t AndMaskBits;
+  int64_t OrMaskBits;
   if (!mi_match(MI, MRI,
-                m_GAnd(m_GOr(m_Reg(Src), m_ICst(MaskOr)), m_ICst(MaskAnd))))
+                m_GAnd(m_GOr(m_Reg(Src), m_ICst(OrMaskBits)),
+                       m_all_of(m_ICst(AndMaskBits), m_Reg(AndMaskReg)))))
     return false;
 
-  // Check if MaskOr could turn on any bits in Src.
-  if (MaskAnd & MaskOr)
+  // Check if OrMask could turn on any bits in Src.
+  if (AndMaskBits & OrMaskBits)
     return false;
 
   MatchInfo = [=, &MI](MachineIRBuilder &B) {
     Observer.changingInstr(MI);
+    // Canonicalize the result to have the constant on the RHS.
+    if (MI.getOperand(1).getReg() == AndMaskReg)
+      MI.getOperand(2).setReg(AndMaskReg);
     MI.getOperand(1).setReg(Src);
     Observer.changedInstr(MI);
   };
@@ -4385,6 +4392,14 @@ bool CombinerHelper::matchBitfieldExtractFromShrAnd(
   const unsigned Size = Ty.getScalarSizeInBits();
   if (ShrAmt < 0 || ShrAmt >= Size)
     return false;
+
+  // If the shift subsumes the mask, emit the 0 directly.
+  if (0 == (SMask >> ShrAmt)) {
+    MatchInfo = [=](MachineIRBuilder &B) {
+      B.buildConstant(Dst, 0);
+    };
+    return true;
+  }
 
   // Check that ubfx can do the extraction, with no holes in the mask.
   uint64_t UMask = SMask;
@@ -5537,6 +5552,112 @@ bool CombinerHelper::matchCombineFSubFpExtFNegFMulToFMadOrFMA(
   }
 
   return false;
+}
+
+bool CombinerHelper::matchSelectToLogical(MachineInstr &MI,
+                                          BuildFnTy &MatchInfo) {
+  GSelect &Sel = cast<GSelect>(MI);
+  Register DstReg = Sel.getReg(0);
+  Register Cond = Sel.getCondReg();
+  Register TrueReg = Sel.getTrueReg();
+  Register FalseReg = Sel.getFalseReg();
+
+  auto *TrueDef = getDefIgnoringCopies(TrueReg, MRI);
+  auto *FalseDef = getDefIgnoringCopies(FalseReg, MRI);
+
+  const LLT CondTy = MRI.getType(Cond);
+  const LLT OpTy = MRI.getType(TrueReg);
+  if (CondTy != OpTy || OpTy.getScalarSizeInBits() != 1)
+    return false;
+
+  // We have a boolean select.
+
+  // select Cond, Cond, F --> or Cond, F
+  // select Cond, 1, F    --> or Cond, F
+  auto MaybeCstTrue = isConstantOrConstantSplatVector(*TrueDef, MRI);
+  if ((Cond == TrueReg || (MaybeCstTrue && MaybeCstTrue->isOne())) &&
+      isLegalOrBeforeLegalizer({TargetOpcode::G_OR, {OpTy}})) {
+    MatchInfo = [=](MachineIRBuilder &MIB) {
+      MIB.buildOr(DstReg, Cond, FalseReg);
+    };
+    return true;
+  }
+
+  // select Cond, T, Cond --> and Cond, T
+  // select Cond, T, 0    --> and Cond, T
+  auto MaybeCstFalse = isConstantOrConstantSplatVector(*FalseDef, MRI);
+  if ((Cond == FalseReg || (MaybeCstFalse && MaybeCstFalse->isZero())) &&
+      isLegalOrBeforeLegalizer({TargetOpcode::G_AND, {OpTy}})) {
+    MatchInfo = [=](MachineIRBuilder &MIB) {
+      MIB.buildAnd(DstReg, Cond, TrueReg);
+    };
+    return true;
+  }
+
+ // select Cond, T, 1 --> or (not Cond), T
+  if (MaybeCstFalse && MaybeCstFalse->isOne() &&
+      isLegalOrBeforeLegalizer({TargetOpcode::G_OR, {OpTy}}) &&
+      isLegalOrBeforeLegalizer({TargetOpcode::G_XOR, {OpTy}})) {
+    MatchInfo = [=](MachineIRBuilder &MIB) {
+      MIB.buildOr(DstReg, MIB.buildNot(OpTy, Cond), TrueReg);
+    };
+    return true;
+  }
+
+  // select Cond, 0, F --> and (not Cond), F
+  if (MaybeCstTrue && MaybeCstTrue->isZero() &&
+      isLegalOrBeforeLegalizer({TargetOpcode::G_AND, {OpTy}}) &&
+      isLegalOrBeforeLegalizer({TargetOpcode::G_XOR, {OpTy}})) {
+    MatchInfo = [=](MachineIRBuilder &MIB) {
+      MIB.buildAnd(DstReg, MIB.buildNot(OpTy, Cond), FalseReg);
+    };
+    return true;
+  }
+  return false;
+}
+
+bool CombinerHelper::matchCombineFMinMaxNaN(MachineInstr &MI,
+                                            unsigned &IdxToPropagate) {
+  bool PropagateNaN;
+  switch (MI.getOpcode()) {
+  default:
+    return false;
+  case TargetOpcode::G_FMINNUM:
+  case TargetOpcode::G_FMAXNUM:
+    PropagateNaN = false;
+    break;
+  case TargetOpcode::G_FMINIMUM:
+  case TargetOpcode::G_FMAXIMUM:
+    PropagateNaN = true;
+    break;
+  }
+
+  auto MatchNaN = [&](unsigned Idx) {
+    Register MaybeNaNReg = MI.getOperand(Idx).getReg();
+    const ConstantFP *MaybeCst = getConstantFPVRegVal(MaybeNaNReg, MRI);
+    if (!MaybeCst || !MaybeCst->getValueAPF().isNaN())
+      return false;
+    IdxToPropagate = PropagateNaN ? Idx : (Idx == 1 ? 2 : 1);
+    return true;
+  };
+
+  return MatchNaN(1) || MatchNaN(2);
+}
+
+bool CombinerHelper::matchAddSubSameReg(MachineInstr &MI, Register &Src) {
+  assert(MI.getOpcode() == TargetOpcode::G_ADD && "Expected a G_ADD");
+  Register LHS = MI.getOperand(1).getReg();
+  Register RHS = MI.getOperand(2).getReg();
+
+  // Helper lambda to check for opportunities for
+  // A + (B - A) -> B
+  // (B - A) + A -> B
+  auto CheckFold = [&](Register MaybeSub, Register MaybeSameReg) {
+    Register Reg;
+    return mi_match(MaybeSub, MRI, m_GSub(m_Reg(Src), m_Reg(Reg))) &&
+           Reg == MaybeSameReg;
+  };
+  return CheckFold(LHS, RHS) || CheckFold(RHS, LHS);
 }
 
 bool CombinerHelper::tryCombine(MachineInstr &MI) {

@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/IR/Constants.h"
@@ -156,6 +157,43 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
   // is a 16-bit architecture because then it most likely is 16 bits. If that
   // isn't true for a target those defaults should be overridden below.
   TLI.setIntSize(T.isArch16Bit() ? 16 : 32);
+
+  if (T.getArch() == Triple::mos) {
+    // The MOS target doesn't come with a standard library yet.
+    TLI.disableAllFunctions();
+    // Freestanding functions are available.
+    TLI.setAvailable(LibFunc_memcpy);
+    TLI.setAvailable(LibFunc_memset);
+
+    // A few other C library functions are also available.
+
+    TLI.setAvailable(LibFunc_printf);
+    TLI.setAvailable(LibFunc_sprintf);
+    TLI.setAvailable(LibFunc_snprintf);
+    TLI.setAvailable(LibFunc_vsnprintf);
+    TLI.setAvailable(LibFunc_vprintf);
+    TLI.setAvailable(LibFunc_putchar);
+    TLI.setAvailable(LibFunc_puts);
+
+    TLI.setAvailable(LibFunc_abs);
+    TLI.setAvailable(LibFunc_labs);
+    TLI.setAvailable(LibFunc_llabs);
+
+    TLI.setAvailable(LibFunc_memchr);
+    TLI.setAvailable(LibFunc_memcmp);
+    TLI.setAvailable(LibFunc_memcpy);
+    TLI.setAvailable(LibFunc_memset);
+    TLI.setAvailable(LibFunc_memmove);
+    TLI.setAvailable(LibFunc_strchr);
+    TLI.setAvailable(LibFunc_strcmp);
+    TLI.setAvailable(LibFunc_strcpy);
+    TLI.setAvailable(LibFunc_strlen);
+    TLI.setAvailable(LibFunc_strncmp);
+    TLI.setAvailable(LibFunc_strncpy);
+    TLI.setAvailable(LibFunc_strrchr);
+
+    return;
+  }
 
   // There is really no runtime library on AMDGPU, apart from
   // __kmpc_alloc/free_shared.
@@ -659,12 +697,12 @@ static void initialize(TargetLibraryInfoImpl &TLI, const Triple &T,
     TLI.setUnavailable(LibFunc_stpncpy);
   }
 
-  if (T.isPS4()) {
-    // PS4 does have memalign.
+  if (T.isPS()) {
+    // PS4/PS5 do have memalign.
     TLI.setAvailable(LibFunc_memalign);
 
-    // PS4 does not have new/delete with "unsigned int" size parameter;
-    // it only has the "unsigned long" versions.
+    // PS4/PS5 do not have new/delete with "unsigned int" size parameter;
+    // they only have the "unsigned long" versions.
     TLI.setUnavailable(LibFunc_ZdaPvj);
     TLI.setUnavailable(LibFunc_ZdaPvjSt11align_val_t);
     TLI.setUnavailable(LibFunc_ZdlPvj);
@@ -1110,9 +1148,11 @@ bool TargetLibraryInfoImpl::isValidProtoForLibFunc(const FunctionType &FTy,
   case LibFunc_system:
     return (NumParams == 1 && FTy.getParamType(0)->isPointerTy());
   case LibFunc___kmpc_alloc_shared:
+    return NumParams == 1 && FTy.getReturnType()->isPointerTy();
   case LibFunc_malloc:
   case LibFunc_vec_malloc:
-    return (NumParams == 1 && FTy.getReturnType()->isPointerTy());
+    return NumParams == 1 && FTy.getParamType(0)->isIntegerTy(SizeTBits) &&
+           FTy.getReturnType()->isPointerTy();
   case LibFunc_memcmp:
     return NumParams == 3 && FTy.getReturnType()->isIntegerTy(32) &&
            FTy.getParamType(0)->isPointerTy() &&

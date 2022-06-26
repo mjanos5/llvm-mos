@@ -355,7 +355,15 @@ public:
     VK_VE_TPOFF_LO32,  // symbol@tpoff_lo
 
     VK_TPREL,
-    VK_DTPREL
+    VK_DTPREL,
+
+    VK_MOS_ADDR8,               // mos8()
+    VK_MOS_ADDR16_LO,           // mos16lo()
+    VK_MOS_ADDR16_HI,           // mos16hi()
+    VK_MOS_ADDR24_BANK,         // mos24bank()
+    VK_MOS_ADDR24_SEGMENT,      // mos24segment()
+    VK_MOS_ADDR24_SEGMENT_LO,   // mos24segmentlo()
+    VK_MOS_ADDR24_SEGMENT_HI    // mos24segmenthi()
   };
 
 private:

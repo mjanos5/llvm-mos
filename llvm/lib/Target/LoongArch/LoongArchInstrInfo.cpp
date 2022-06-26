@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LoongArchInstrInfo.h"
+#include "LoongArch.h"
 
 using namespace llvm;
 
@@ -19,6 +20,30 @@ using namespace llvm;
 
 LoongArchInstrInfo::LoongArchInstrInfo(LoongArchSubtarget &STI)
     // FIXME: add CFSetup and CFDestroy Inst when we implement function call.
-    : LoongArchGenInstrInfo(),
+    : LoongArchGenInstrInfo() {}
 
-      STI(STI) {}
+void LoongArchInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
+                                     MachineBasicBlock::iterator MBBI,
+                                     const DebugLoc &DL, MCRegister DstReg,
+                                     MCRegister SrcReg, bool KillSrc) const {
+  if (LoongArch::GPRRegClass.contains(DstReg, SrcReg)) {
+    BuildMI(MBB, MBBI, DL, get(LoongArch::OR), DstReg)
+        .addReg(SrcReg, getKillRegState(KillSrc))
+        .addReg(LoongArch::R0);
+    return;
+  }
+
+  // FPR->FPR copies.
+  unsigned Opc;
+  if (LoongArch::FPR32RegClass.contains(DstReg, SrcReg)) {
+    Opc = LoongArch::FMOV_S;
+  } else if (LoongArch::FPR64RegClass.contains(DstReg, SrcReg)) {
+    Opc = LoongArch::FMOV_D;
+  } else {
+    // TODO: support other copies.
+    llvm_unreachable("Impossible reg-to-reg copy");
+  }
+
+  BuildMI(MBB, MBBI, DL, get(Opc), DstReg)
+      .addReg(SrcReg, getKillRegState(KillSrc));
+}

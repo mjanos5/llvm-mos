@@ -94,6 +94,13 @@ StringRef llvm::object::getELFRelocationTypeName(uint32_t Machine,
       break;
     }
     break;
+  case ELF::EM_MOS:
+    switch (Type) {
+#include "llvm/BinaryFormat/ELFRelocs/MOS.def"
+    default:
+      break;
+    }
+    break;
   case ELF::EM_PPC:
     switch (Type) {
 #include "llvm/BinaryFormat/ELFRelocs/PowerPC.def"
@@ -568,11 +575,9 @@ Expected<typename ELFT::DynRange> ELFFile<ELFT>::dynamicEntries() const {
   }
 
   if (Dyn.empty())
-    // TODO: this error is untested.
     return createError("invalid empty dynamic section");
 
   if (Dyn.back().d_tag != ELF::DT_NULL)
-    // TODO: this error is untested.
     return createError("dynamic sections must be DT_NULL terminated");
 
   return Dyn;

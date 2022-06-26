@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #include "SplitKit.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -23,7 +24,6 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/LiveInterval.h"
-#include "llvm/CodeGen/LiveIntervalCalc.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
 #include "llvm/CodeGen/LiveStacks.h"
@@ -488,6 +488,8 @@ void InlineSpiller::eliminateRedundantSpills(LiveInterval &SLI, VNInfo *VNI) {
         LLVM_DEBUG(dbgs() << "Redundant spill " << Idx << '\t' << MI);
         // eliminateDeadDefs won't normally remove stores, so switch opcode.
         MI.setDesc(TII.get(TargetOpcode::KILL));
+        for (MachineOperand &MO : MI.defs())
+          MO.setIsDead();
         DeadDefs.push_back(&MI);
         ++NumSpillsRemoved;
         if (HSpiller.rmFromMergeableSpills(MI, StackSlot))
@@ -686,7 +688,7 @@ void InlineSpiller::reMaterializeAll() {
   // Remove any values that were completely rematted.
   for (Register Reg : RegsToSpill) {
     LiveInterval &LI = LIS.getInterval(Reg);
-    for (VNInfo *VNI : llvm::make_range(LI.vni_begin(), LI.vni_end())) {
+    for (VNInfo *VNI : LI.vnis()) {
       if (VNI->isUnused() || VNI->isPHIDef() || UsedValues.count(VNI))
         continue;
       MachineInstr *MI = LIS.getInstructionFromIndex(VNI->def);
@@ -964,7 +966,7 @@ foldMemoryOperand(ArrayRef<std::pair<MachineInstr *, unsigned>> Ops,
       if (!MO.isReg() || !MO.isImplicit())
         break;
       if (MO.getReg() == ImpReg)
-        FoldMI->RemoveOperand(i - 1);
+        FoldMI->removeOperand(i - 1);
     }
 
   LLVM_DEBUG(dumpMachineInstrRangeWithSlotIndex(MIS.begin(), MIS.end(), LIS,
@@ -1222,7 +1224,10 @@ void InlineSpiller::spill(LiveRangeEdit &edit) {
 }
 
 /// Optimizations after all the reg selections and spills are done.
-void InlineSpiller::postOptimization() { HSpiller.hoistAllSpills(); }
+void InlineSpiller::postOptimization() {
+  if (!DisableHoisting)
+    HSpiller.hoistAllSpills();
+}
 
 /// When a spill is inserted, add the spill to MergeableSpills map.
 void HoistSpillHelper::addToMergeableSpills(MachineInstr &Spill, int StackSlot,
@@ -1608,7 +1613,7 @@ void HoistSpillHelper::hoistAllSpills() {
       for (unsigned i = RMEnt->getNumOperands(); i; --i) {
         MachineOperand &MO = RMEnt->getOperand(i - 1);
         if (MO.isReg() && MO.isImplicit() && MO.isDef() && !MO.isDead())
-          RMEnt->RemoveOperand(i - 1);
+          RMEnt->removeOperand(i - 1);
       }
     }
     Edit.eliminateDeadDefs(SpillsToRm, None, AA);

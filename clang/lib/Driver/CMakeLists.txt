@@ -1,9 +1,12 @@
+# Modified by Daniel Thornburgh (mysterymath@gmail.com).
+
 set(LLVM_LINK_COMPONENTS
   BinaryFormat
   MC
   Option
   ProfileData
   Support
+  WindowsDriver
   )
 
 if(WIN32)
@@ -26,8 +29,10 @@ add_clang_library(clangDriver
   ToolChain.cpp
   ToolChains/Arch/AArch64.cpp
   ToolChains/Arch/ARM.cpp
+  ToolChains/Arch/CSKY.cpp
   ToolChains/Arch/M68k.cpp
   ToolChains/Arch/Mips.cpp
+  ToolChains/Arch/MOS.cpp
   ToolChains/Arch/PPC.cpp
   ToolChains/Arch/RISCV.cpp
   ToolChains/Arch/Sparc.cpp
@@ -45,6 +50,7 @@ add_clang_library(clangDriver
   ToolChains/CommonArgs.cpp
   ToolChains/Contiki.cpp
   ToolChains/CrossWindows.cpp
+  ToolChains/CSKYToolChain.cpp
   ToolChains/Cuda.cpp
   ToolChains/Darwin.cpp
   ToolChains/DragonFly.cpp
@@ -57,11 +63,13 @@ add_clang_library(clangDriver
   ToolChains/HIPAMD.cpp
   ToolChains/HIPSPV.cpp
   ToolChains/Hexagon.cpp
+  ToolChains/HLSL.cpp
   ToolChains/Hurd.cpp
   ToolChains/Linux.cpp
   ToolChains/MipsLinux.cpp
   ToolChains/MinGW.cpp
   ToolChains/Minix.cpp
+  ToolChains/MOS.cpp
   ToolChains/MSP430.cpp
   ToolChains/MSVC.cpp
   ToolChains/Myriad.cpp

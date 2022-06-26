@@ -243,7 +243,8 @@ def MxEncEAk : MxEncEA<MxBead3Bits<0b011>, MxBead2Bits<0b11>, MxBead1Bit<1>>;
 def MxEncEAi : MxEncEA<MxBead3Bits<0b100>, MxBead2Bits<0b11>, MxBead1Bit<1>>;
 
 class MxEncBriefExt<string reg_opnd, string disp_opnd,
-                    bit size_w_l = false, int scale = 1> {
+                    bit size_w_l = false, int scale = 1,
+                    string disp_encoder = ""> {
   dag Value = (descend
     // D/A + REGISTER
     (operand "$"#reg_opnd, 4),
@@ -258,16 +259,32 @@ class MxEncBriefExt<string reg_opnd, string disp_opnd,
     ),
     0b0,
     // Displacement
-    (operand "$"#disp_opnd, 8)
+    (operand "$"#disp_opnd, 8, (encoder disp_encoder))
   );
+}
+
+class MxEncAddrMode_d<string reg_opnd> : MxEncMemOp {
+  let EA = (descend /*MODE*/0b000,
+                    /*REGISTER*/(operand "$"#reg_opnd, 3));
+}
+
+class MxEncAddrMode_a<string reg_opnd> : MxEncMemOp {
+  let EA = (descend /*MODE*/0b001,
+                    /*REGISTER*/(operand "$"#reg_opnd, 3));
+}
+
+class MxEncAddrMode_r<string reg_opnd> : MxEncMemOp {
+  let EA = (descend /*MODE without the last bit*/0b00,
+                    /*REGISTER with D/A bit*/(operand "$"#reg_opnd, 4));
 }
 
 class MxEncAddrMode_k<string opnd_name> : MxEncMemOp {
   let EA = (descend /*MODE*/0b111,
-                     /*REGISTER*/0b011);
+                    /*REGISTER*/0b011);
 
   let Supplement = MxEncBriefExt<opnd_name#".index", opnd_name#".disp",
-                                 /*W/L*/true>.Value;
+                                 /*W/L*/true, /*SCALE*/1,
+                                 "encodePCRelImm<8>">.Value;
 }
 
 class MxEncAddrMode_q<string opnd_name> : MxEncMemOp {
@@ -275,7 +292,8 @@ class MxEncAddrMode_q<string opnd_name> : MxEncMemOp {
                      /*REGISTER*/0b010);
 
   // 16-bit Displacement
-  let Supplement = (operand "$"#opnd_name, 16);
+  let Supplement = (operand "$"#opnd_name, 16,
+                            (encoder "encodePCRelImm<16>"));
 }
 
 class MxEncAddrMode_p<string opnd_name> : MxEncMemOp {
@@ -283,7 +301,8 @@ class MxEncAddrMode_p<string opnd_name> : MxEncMemOp {
                      /*REGISTER*/(operand "$"#opnd_name#".reg", 3));
 
   // 16-bit Displacement
-  let Supplement = (operand "$"#opnd_name#".disp", 16);
+  let Supplement = (operand "$"#opnd_name#".disp", 16,
+                            (encoder "encodeRelocImm<16>"));
 }
 
 class MxEncAddrMode_f<string opnd_name> : MxEncMemOp {
@@ -291,7 +310,8 @@ class MxEncAddrMode_f<string opnd_name> : MxEncMemOp {
                      /*REGISTER*/(operand "$"#opnd_name#".reg", 3));
 
   let Supplement = MxEncBriefExt<opnd_name#".index", opnd_name#".disp",
-                                 /*W/L*/true>.Value;
+                                 /*W/L*/true, /*SCALE*/1,
+                                 "encodeRelocImm<8>">.Value;
 }
 
 class MxEncAddrMode_j<string reg_opnd> : MxEncMemOp {
@@ -317,16 +337,29 @@ class MxEncAddrMode_i<string opnd_name, int size> : MxEncMemOp {
 // abs.L -> size_w_l = true
 class MxEncAddrMode_abs<string opnd_name, bit size_w_l = false> : MxEncMemOp {
   let EA = (descend /*MODE*/0b111,
-                     /*REGISTER*/0b00, size_w_l);
+                    // Wrap the REGISTER part in another dag to make sure
+                    // the dag assigned to EA only has two arguments. Such
+                    // that it's easier for MOV instructions to reverse
+                    // on its destination part.
+                    /*REGISTER*/(descend 0b00, size_w_l));
 
   // Absolute address
   let Supplement = !if(size_w_l,
     // abs.L
-    (ascend (slice "$"#opnd_name, 31, 16),
-            (slice "$"#opnd_name, 15, 0)),
+    (operand "$"#opnd_name, 32, (encoder "encodeRelocImm<32>")),
     // abs.W
-    (operand "$"#opnd_name, 16)
+    (operand "$"#opnd_name, 16, (encoder "encodeRelocImm<16>"))
   );
+}
+
+class MxEncAddrMode_o<string reg_opnd> : MxEncMemOp {
+  let EA = (descend /*MODE*/0b011,
+                    /*REGISTER*/(operand "$"#reg_opnd, 3));
+}
+
+class MxEncAddrMode_e<string reg_opnd> : MxEncMemOp {
+  let EA = (descend /*MODE*/0b100,
+                    /*REGISTER*/(operand "$"#reg_opnd, 3));
 }
 
 // Allows you to specify each bit of opcode

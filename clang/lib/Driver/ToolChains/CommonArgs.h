@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #ifndef LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_COMMONARGS_H
 #define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_COMMONARGS_H
 
@@ -111,11 +112,26 @@ void addOpenMPRuntimeSpecificRPath(const ToolChain &TC,
                                    llvm::opt::ArgStringList &CmdArgs);
 void addArchSpecificRPath(const ToolChain &TC, const llvm::opt::ArgList &Args,
                           llvm::opt::ArgStringList &CmdArgs);
+void addOpenMPRuntimeLibraryPath(const ToolChain &TC,
+                                 const llvm::opt::ArgList &Args,
+                                 llvm::opt::ArgStringList &CmdArgs);
 /// Returns true, if an OpenMP runtime has been added.
 bool addOpenMPRuntime(llvm::opt::ArgStringList &CmdArgs, const ToolChain &TC,
                       const llvm::opt::ArgList &Args,
                       bool ForceStaticHostRuntime = false,
                       bool IsOffloadingHost = false, bool GompNeedsRT = false);
+
+/// Adds Fortran runtime libraries to \p CmdArgs.
+void addFortranRuntimeLibs(const ToolChain &TC,
+                           llvm::opt::ArgStringList &CmdArgs);
+
+/// Adds the path for the Fortran runtime libraries to \p CmdArgs.
+void addFortranRuntimeLibraryPath(const ToolChain &TC,
+                                  const llvm::opt::ArgList &Args,
+                                  llvm::opt::ArgStringList &CmdArgs);
+
+void addHIPRuntimeLibArgs(const ToolChain &TC, const llvm::opt::ArgList &Args,
+                          llvm::opt::ArgStringList &CmdArgs);
 
 const char *getAsNeededOption(const ToolChain &TC, bool as_needed);
 
@@ -159,8 +175,7 @@ void handleTargetFeaturesGroup(const llvm::opt::ArgList &Args,
                                llvm::opt::OptSpecifier Group);
 
 /// If there are multiple +xxx or -xxx features, keep the last one.
-std::vector<StringRef>
-unifyTargetFeatures(const std::vector<StringRef> &Features);
+SmallVector<StringRef> unifyTargetFeatures(ArrayRef<StringRef> Features);
 
 /// Handles the -save-stats option and returns the filename to save statistics
 /// to.
@@ -175,6 +190,8 @@ void addMultilibFlag(bool Enabled, const char *const Flag,
 
 void addX86AlignBranchArgs(const Driver &D, const llvm::opt::ArgList &Args,
                            llvm::opt::ArgStringList &CmdArgs, bool IsLTO);
+
+void addMOSCodeGenArgs(llvm::opt::ArgStringList &CmdArgs);
 
 void checkAMDGPUCodeObjectVersion(const Driver &D,
                                   const llvm::opt::ArgList &Args);

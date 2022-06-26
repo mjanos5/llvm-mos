@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #include "llvm/Object/IRSymtab.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -49,6 +50,17 @@ static const char *PreservedSymbols[] = {
 #define HANDLE_LIBCALL(code, name) name,
 #include "llvm/IR/RuntimeLibcalls.def"
 #undef HANDLE_LIBCALL
+    // Needed by MOS target.
+    "__memset",
+    "__udivmodqi4",
+    "__udivmodhi4",
+    "__udivmodsi4",
+    "__udivmoddi4",
+    "__divmodqi4",
+    "__divmodhi4",
+    "__divmodsi4",
+    "__divmoddi4",
+    "abort",
     // There are global variables, so put it here instead of in
     // RuntimeLibcalls.def.
     // TODO: Are there similar such variables?

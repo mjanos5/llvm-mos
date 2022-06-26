@@ -92,9 +92,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/OperandTraits.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
@@ -115,12 +113,12 @@
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -143,10 +141,7 @@ static const unsigned MaxIVUsers = 200;
 /// the salvaging is not too expensive for the compiler.
 static const unsigned MaxSCEVSalvageExpressionSize = 64;
 
-// Temporary flag to cleanup congruent phis after LSR phi expansion.
-// It's currently disabled until we can determine whether it's truly useful or
-// not. The flag should be removed after the v3.0 release.
-// This is now needed for ivchains.
+// Cleanup congruent phis after LSR phi expansion.
 static cl::opt<bool> EnablePhiElim(
   "enable-lsr-phielim", cl::Hidden, cl::init(true),
   cl::desc("Enable LSR phi elimination"));
@@ -381,6 +376,10 @@ struct Formula {
   /// field rather than a register.
   int64_t UnfoldedOffset = 0;
 
+  /// The type of this formula, if it has one, or null otherwise. This type
+  /// is meaningless except for the bit size.
+  Type *Ty = nullptr;
+
   Formula() = default;
 
   void initialMatch(const SCEV *S, Loop *L, ScalarEvolution &SE);
@@ -394,13 +393,16 @@ struct Formula {
   bool hasZeroEnd() const;
 
   size_t getNumRegs() const;
-  Type *getType() const;
 
   void deleteBaseReg(const SCEV *&S);
 
   bool referencesReg(const SCEV *S) const;
   bool hasRegsUsedByUsesOtherThan(size_t LUIdx,
                                   const RegUseTracker &RegUses) const;
+
+
+  Type *baseType() const;
+  Type *scaleType() const;
 
   void print(raw_ostream &OS) const;
   void dump() const;
@@ -480,6 +482,16 @@ void Formula::initialMatch(const SCEV *S, Loop *L, ScalarEvolution &SE) {
     HasBaseReg = true;
   }
   canonicalize(*L);
+  Ty = !BaseRegs.empty() ? BaseRegs.front()->getType()
+       : ScaledReg       ? ScaledReg->getType()
+       : BaseGV          ? BaseGV->getType()
+                         : nullptr;
+}
+
+static bool containsAddRecDependentOnLoop(const SCEV *S, const Loop &L) {
+  return SCEVExprContains(S, [&L](const SCEV *S) {
+    return isa<SCEVAddRecExpr>(S) && (cast<SCEVAddRecExpr>(S)->getLoop() == &L);
+  });
 }
 
 /// Check whether or not this formula satisfies the canonical
@@ -495,18 +507,15 @@ bool Formula::isCanonical(const Loop &L) const {
   if (Scale == 1 && BaseRegs.empty())
     return false;
 
-  const SCEVAddRecExpr *SAR = dyn_cast<const SCEVAddRecExpr>(ScaledReg);
-  if (SAR && SAR->getLoop() == &L)
+  if (containsAddRecDependentOnLoop(ScaledReg, L))
     return true;
 
   // If ScaledReg is not a recurrent expr, or it is but its loop is not current
   // loop, meanwhile BaseRegs contains a recurrent expr reg related with current
   // loop, we want to swap the reg in BaseRegs with ScaledReg.
-  auto I = find_if(BaseRegs, [&](const SCEV *S) {
-    return isa<const SCEVAddRecExpr>(S) &&
-           (cast<SCEVAddRecExpr>(S)->getLoop() == &L);
+  return none_of(BaseRegs, [&L](const SCEV *S) {
+    return containsAddRecDependentOnLoop(S, L);
   });
-  return I == BaseRegs.end();
 }
 
 /// Helper method to morph a formula into its canonical representation.
@@ -538,11 +547,9 @@ void Formula::canonicalize(const Loop &L) {
   // If ScaledReg is an invariant with respect to L, find the reg from
   // BaseRegs containing the recurrent expr related with Loop L. Swap the
   // reg with ScaledReg.
-  const SCEVAddRecExpr *SAR = dyn_cast<const SCEVAddRecExpr>(ScaledReg);
-  if (!SAR || SAR->getLoop() != &L) {
-    auto I = find_if(BaseRegs, [&](const SCEV *S) {
-      return isa<const SCEVAddRecExpr>(S) &&
-             (cast<SCEVAddRecExpr>(S)->getLoop() == &L);
+  if (!containsAddRecDependentOnLoop(ScaledReg, L)) {
+    auto I = find_if(BaseRegs, [&L](const SCEV *S) {
+      return containsAddRecDependentOnLoop(S, L);
     });
     if (I != BaseRegs.end())
       std::swap(ScaledReg, *I);
@@ -577,15 +584,6 @@ size_t Formula::getNumRegs() const {
   return !!ScaledReg + BaseRegs.size();
 }
 
-/// Return the type of this formula, if it has one, or null otherwise. This type
-/// is meaningless except for the bit size.
-Type *Formula::getType() const {
-  return !BaseRegs.empty() ? BaseRegs.front()->getType() :
-         ScaledReg ? ScaledReg->getType() :
-         BaseGV ? BaseGV->getType() :
-         nullptr;
-}
-
 /// Delete the given base reg from the BaseRegs list.
 void Formula::deleteBaseReg(const SCEV *&S) {
   if (&S != &BaseRegs.back())
@@ -609,6 +607,18 @@ bool Formula::hasRegsUsedByUsesOtherThan(size_t LUIdx,
     if (RegUses.isRegUsedByUsesOtherThan(BaseReg, LUIdx))
       return true;
   return false;
+}
+
+Type *Formula::baseType() const {
+  if (BaseRegs.empty())
+    return nullptr;
+  return BaseRegs.front()->getType();
+}
+
+Type *Formula::scaleType() const {
+  if (!ScaledReg)
+    return nullptr;
+  return ScaledReg->getType();
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
@@ -1071,7 +1081,7 @@ public:
     C.ScaleCost = 0;
   }
 
-  bool isLess(Cost &Other);
+  bool isLess(const Cost &Other);
 
   void Lose();
 
@@ -1246,8 +1256,8 @@ public:
 static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
                                  LSRUse::KindType Kind, MemAccessTy AccessTy,
                                  GlobalValue *BaseGV, int64_t BaseOffset,
-                                 bool HasBaseReg, int64_t Scale,
-                                 Instruction *Fixup = nullptr);
+                                 bool HasBaseReg, Type *BaseType, int64_t Scale,
+                                 Type *ScaleType, Instruction *Fixup = nullptr);
 
 static unsigned getSetupCost(const SCEV *Reg, unsigned Depth) {
   if (isa<SCEVUnknown>(Reg) || isa<SCEVConstant>(Reg))
@@ -1272,6 +1282,7 @@ static unsigned getSetupCost(const SCEV *Reg, unsigned Depth) {
 /// Tally up interesting quantities from the given register.
 void Cost::RateRegister(const Formula &F, const SCEV *Reg,
                         SmallPtrSetImpl<const SCEV *> &Regs) {
+  const DataLayout &DL = L->getHeader()->getModule()->getDataLayout();
   if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Reg)) {
     // If this is an addrec for another loop, it should be an invariant
     // with respect to L since L is the innermost loop (at least
@@ -1293,7 +1304,8 @@ void Cost::RateRegister(const Formula &F, const SCEV *Reg,
       return;
     }
 
-    unsigned LoopCost = 1;
+    unsigned LoopCost =
+        DL.isLegalInteger(SE->getTypeSizeInBits(AR->getType())) ? 1 : 2;
     if (TTI->isIndexedLoadLegal(TTI->MIM_PostInc, AR->getType()) ||
         TTI->isIndexedStoreLegal(TTI->MIM_PostInc, AR->getType())) {
 
@@ -1359,6 +1371,8 @@ void Cost::RateFormula(const Formula &F,
                        const DenseSet<const SCEV *> &VisitedRegs,
                        const LSRUse &LU,
                        SmallPtrSetImpl<const SCEV *> *LoserRegs) {
+  if (isLoser())
+    return;
   assert(F.isCanonical(*L) && "Cost is accurate only for canonical formula");
   // Tally up the registers.
   unsigned PrevAddRecCost = C.AddRecCost;
@@ -1385,12 +1399,13 @@ void Cost::RateFormula(const Formula &F,
 
   // Determine how many (unfolded) adds we'll need inside the loop.
   size_t NumBaseParts = F.getNumRegs();
+  size_t NumBaseAdds = 0;
   if (NumBaseParts > 1)
     // Do not count the base and a possible second register if the target
     // allows to fold 2 registers.
-    C.NumBaseAdds +=
+    NumBaseAdds +=
         NumBaseParts - (1 + (F.Scale && isAMCompletelyFolded(*TTI, LU, F)));
-  C.NumBaseAdds += (F.UnfoldedOffset != 0);
+  NumBaseAdds += (F.UnfoldedOffset != 0);
 
   // Accumulate non-free scaling amounts.
   C.ScaleCost += *getScalingFactorCost(*TTI, LU, F, *L).getValue();
@@ -1409,9 +1424,15 @@ void Cost::RateFormula(const Formula &F,
     // specifically not supported.
     if (LU.Kind == LSRUse::Address && Offset != 0 &&
         !isAMCompletelyFolded(*TTI, LSRUse::Address, LU.AccessTy, F.BaseGV,
-                              Offset, F.HasBaseReg, F.Scale, Fixup.UserInst))
-      C.NumBaseAdds++;
+                              Offset, F.HasBaseReg, F.baseType(), F.Scale,
+                              F.scaleType(), Fixup.UserInst))
+      NumBaseAdds++;
   }
+
+  const DataLayout &DL = L->getHeader()->getModule()->getDataLayout();
+  if (DL.isIllegalInteger(SE->getTypeSizeInBits(F.Ty)))
+    NumBaseAdds *= 2;
+  C.NumBaseAdds += NumBaseAdds;
 
   // If we don't count instruction cost exit here.
   if (!InsnsCost) {
@@ -1423,7 +1444,7 @@ void Cost::RateFormula(const Formula &F,
   // additional instruction (at least fill).
   // TODO: Need distinguish register class?
   unsigned TTIRegNum = TTI->getNumberOfRegisters(
-                       TTI->getRegisterClassForType(false, F.getType())) - 1;
+                       TTI->getRegisterClassForType(false, F.Ty)) - 1;
   if (C.NumRegs > TTIRegNum) {
     // Cost already exceeded TTIRegNum, then only newly added register can add
     // new instructions.
@@ -1468,7 +1489,7 @@ void Cost::Lose() {
 }
 
 /// Choose the lower cost.
-bool Cost::isLess(Cost &Other) {
+bool Cost::isLess(const Cost &Other) {
   if (InsnsCost.getNumOccurrences() > 0 && InsnsCost &&
       C.Insns != Other.C.Insns)
     return C.Insns < Other.C.Insns;
@@ -1663,12 +1684,14 @@ LLVM_DUMP_METHOD void LSRUse::dump() const {
 static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
                                  LSRUse::KindType Kind, MemAccessTy AccessTy,
                                  GlobalValue *BaseGV, int64_t BaseOffset,
-                                 bool HasBaseReg, int64_t Scale,
-                                 Instruction *Fixup/*= nullptr*/) {
+                                 bool HasBaseReg, Type *BaseType, int64_t Scale,
+                                 Type *ScaleType,
+                                 Instruction *Fixup /*= nullptr*/) {
   switch (Kind) {
   case LSRUse::Address:
     return TTI.isLegalAddressingMode(AccessTy.MemTy, BaseGV, BaseOffset,
-                                     HasBaseReg, Scale, AccessTy.AddrSpace, Fixup);
+                                     HasBaseReg, BaseType, Scale, ScaleType,
+                                     AccessTy.AddrSpace, Fixup);
 
   case LSRUse::ICmpZero:
     // There's not even a target hook for querying whether it would be legal to
@@ -1718,7 +1741,8 @@ static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
                                  int64_t MinOffset, int64_t MaxOffset,
                                  LSRUse::KindType Kind, MemAccessTy AccessTy,
                                  GlobalValue *BaseGV, int64_t BaseOffset,
-                                 bool HasBaseReg, int64_t Scale) {
+                                 bool HasBaseReg, Type *BaseType, int64_t Scale,
+                                 Type *ScaleType) {
   // Check for overflow.
   if (((int64_t)((uint64_t)BaseOffset + MinOffset) > BaseOffset) !=
       (MinOffset > 0))
@@ -1730,9 +1754,9 @@ static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
   MaxOffset = (uint64_t)BaseOffset + MaxOffset;
 
   return isAMCompletelyFolded(TTI, Kind, AccessTy, BaseGV, MinOffset,
-                              HasBaseReg, Scale) &&
+                              HasBaseReg, BaseType, Scale, ScaleType) &&
          isAMCompletelyFolded(TTI, Kind, AccessTy, BaseGV, MaxOffset,
-                              HasBaseReg, Scale);
+                              HasBaseReg, BaseType, Scale, ScaleType);
 }
 
 static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
@@ -1748,29 +1772,31 @@ static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
   // compile time sake.
   assert((F.isCanonical(L) || F.Scale != 0));
   return isAMCompletelyFolded(TTI, MinOffset, MaxOffset, Kind, AccessTy,
-                              F.BaseGV, F.BaseOffset, F.HasBaseReg, F.Scale);
+                              F.BaseGV, F.BaseOffset, F.HasBaseReg,
+                              F.baseType(), F.Scale, F.scaleType());
 }
 
 /// Test whether we know how to expand the current formula.
 static bool isLegalUse(const TargetTransformInfo &TTI, int64_t MinOffset,
                        int64_t MaxOffset, LSRUse::KindType Kind,
                        MemAccessTy AccessTy, GlobalValue *BaseGV,
-                       int64_t BaseOffset, bool HasBaseReg, int64_t Scale) {
+                       int64_t BaseOffset, bool HasBaseReg, Type *BaseType,
+                       int64_t Scale, Type *ScaleType) {
   // We know how to expand completely foldable formulae.
   return isAMCompletelyFolded(TTI, MinOffset, MaxOffset, Kind, AccessTy, BaseGV,
-                              BaseOffset, HasBaseReg, Scale) ||
+                              BaseOffset, HasBaseReg, BaseType, Scale, ScaleType) ||
          // Or formulae that use a base register produced by a sum of base
          // registers.
          (Scale == 1 &&
           isAMCompletelyFolded(TTI, MinOffset, MaxOffset, Kind, AccessTy,
-                               BaseGV, BaseOffset, true, 0));
+                               BaseGV, BaseOffset, true, BaseType, 0, nullptr));
 }
 
 static bool isLegalUse(const TargetTransformInfo &TTI, int64_t MinOffset,
                        int64_t MaxOffset, LSRUse::KindType Kind,
                        MemAccessTy AccessTy, const Formula &F) {
   return isLegalUse(TTI, MinOffset, MaxOffset, Kind, AccessTy, F.BaseGV,
-                    F.BaseOffset, F.HasBaseReg, F.Scale);
+                    F.BaseOffset, F.HasBaseReg, F.baseType(), F.Scale, F.scaleType());
 }
 
 static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
@@ -1780,14 +1806,15 @@ static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
     for (const LSRFixup &Fixup : LU.Fixups)
       if (!isAMCompletelyFolded(TTI, LSRUse::Address, LU.AccessTy, F.BaseGV,
                                 (F.BaseOffset + Fixup.Offset), F.HasBaseReg,
-                                F.Scale, Fixup.UserInst))
+                                F.baseType(), F.Scale, F.scaleType(),
+                                Fixup.UserInst))
         return false;
     return true;
   }
 
   return isAMCompletelyFolded(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind,
                               LU.AccessTy, F.BaseGV, F.BaseOffset, F.HasBaseReg,
-                              F.Scale);
+                              F.baseType(), F.Scale, F.scaleType());
 }
 
 static InstructionCost getScalingFactorCost(const TargetTransformInfo &TTI,
@@ -1807,10 +1834,10 @@ static InstructionCost getScalingFactorCost(const TargetTransformInfo &TTI,
     // Check the scaling factor cost with both the min and max offsets.
     InstructionCost ScaleCostMinOffset = TTI.getScalingFactorCost(
         LU.AccessTy.MemTy, F.BaseGV, F.BaseOffset + LU.MinOffset, F.HasBaseReg,
-        F.Scale, LU.AccessTy.AddrSpace);
+        F.baseType(), F.Scale, F.scaleType(), LU.AccessTy.AddrSpace);
     InstructionCost ScaleCostMaxOffset = TTI.getScalingFactorCost(
         LU.AccessTy.MemTy, F.BaseGV, F.BaseOffset + LU.MaxOffset, F.HasBaseReg,
-        F.Scale, LU.AccessTy.AddrSpace);
+        F.baseType(), F.Scale, F.scaleType(), LU.AccessTy.AddrSpace);
 
     assert(ScaleCostMinOffset.isValid() && ScaleCostMaxOffset.isValid() &&
            "Legal addressing mode has an illegal cost!");
@@ -1830,7 +1857,7 @@ static InstructionCost getScalingFactorCost(const TargetTransformInfo &TTI,
 static bool isAlwaysFoldable(const TargetTransformInfo &TTI,
                              LSRUse::KindType Kind, MemAccessTy AccessTy,
                              GlobalValue *BaseGV, int64_t BaseOffset,
-                             bool HasBaseReg) {
+                             bool HasBaseReg, Type *BaseType) {
   // Fast-path: zero is always foldable.
   if (BaseOffset == 0 && !BaseGV) return true;
 
@@ -1846,7 +1873,8 @@ static bool isAlwaysFoldable(const TargetTransformInfo &TTI,
   }
 
   return isAMCompletelyFolded(TTI, Kind, AccessTy, BaseGV, BaseOffset,
-                              HasBaseReg, Scale);
+                              HasBaseReg, BaseType, Scale,
+                              /*ScaleType=*/nullptr);
 }
 
 static bool isAlwaysFoldable(const TargetTransformInfo &TTI,
@@ -1873,7 +1901,8 @@ static bool isAlwaysFoldable(const TargetTransformInfo &TTI,
   int64_t Scale = Kind == LSRUse::ICmpZero ? -1 : 1;
 
   return isAMCompletelyFolded(TTI, MinOffset, MaxOffset, Kind, AccessTy, BaseGV,
-                              BaseOffset, HasBaseReg, Scale);
+                              BaseOffset, HasBaseReg, S->getType(), Scale,
+                              /*ScaleType=*/nullptr);
 }
 
 namespace {
@@ -2011,7 +2040,8 @@ class LSRInstance {
   UseMapTy UseMap;
 
   bool reconcileNewOffset(LSRUse &LU, int64_t NewOffset, bool HasBaseReg,
-                          LSRUse::KindType Kind, MemAccessTy AccessTy);
+                          Type *BaseType, LSRUse::KindType Kind,
+                          MemAccessTy AccessTy);
 
   std::pair<size_t, int64_t> getUse(const SCEV *&Expr, LSRUse::KindType Kind,
                                     MemAccessTy AccessTy);
@@ -2046,6 +2076,7 @@ class LSRInstance {
   void GenerateICmpZeroScales(LSRUse &LU, unsigned LUIdx, Formula Base);
   void GenerateScales(LSRUse &LU, unsigned LUIdx, Formula Base);
   void GenerateTruncates(LSRUse &LU, unsigned LUIdx, Formula Base);
+  void GenerateZExts(LSRUse &LU, unsigned LUIdx, Formula Base);
   void GenerateCrossUseConstantOffsets();
   void GenerateAllReuseFormulae();
 
@@ -2560,7 +2591,8 @@ LSRInstance::OptimizeLoopTermCond() {
 /// Determine if the given use can accommodate a fixup at the given offset and
 /// other details. If so, update the use and return true.
 bool LSRInstance::reconcileNewOffset(LSRUse &LU, int64_t NewOffset,
-                                     bool HasBaseReg, LSRUse::KindType Kind,
+                                     bool HasBaseReg, Type *BaseType,
+                                     LSRUse::KindType Kind,
                                      MemAccessTy AccessTy) {
   int64_t NewMinOffset = LU.MinOffset;
   int64_t NewMaxOffset = LU.MaxOffset;
@@ -2585,12 +2617,12 @@ bool LSRInstance::reconcileNewOffset(LSRUse &LU, int64_t NewOffset,
   // Conservatively assume HasBaseReg is true for now.
   if (NewOffset < LU.MinOffset) {
     if (!isAlwaysFoldable(TTI, Kind, NewAccessTy, /*BaseGV=*/nullptr,
-                          LU.MaxOffset - NewOffset, HasBaseReg))
+                          LU.MaxOffset - NewOffset, HasBaseReg, BaseType))
       return false;
     NewMinOffset = NewOffset;
   } else if (NewOffset > LU.MaxOffset) {
     if (!isAlwaysFoldable(TTI, Kind, NewAccessTy, /*BaseGV=*/nullptr,
-                          NewOffset - LU.MinOffset, HasBaseReg))
+                          NewOffset - LU.MinOffset, HasBaseReg, BaseType))
       return false;
     NewMaxOffset = NewOffset;
   }
@@ -2613,7 +2645,7 @@ std::pair<size_t, int64_t> LSRInstance::getUse(const SCEV *&Expr,
 
   // Basic uses can't accept any offset, for example.
   if (!isAlwaysFoldable(TTI, Kind, AccessTy, /*BaseGV=*/ nullptr,
-                        Offset, /*HasBaseReg=*/ true)) {
+                        Offset, /*HasBaseReg=*/ true, Expr->getType())) {
     Expr = Copy;
     Offset = 0;
   }
@@ -2624,9 +2656,11 @@ std::pair<size_t, int64_t> LSRInstance::getUse(const SCEV *&Expr,
     // A use already existed with this base.
     size_t LUIdx = P.first->second;
     LSRUse &LU = Uses[LUIdx];
-    if (reconcileNewOffset(LU, Offset, /*HasBaseReg=*/true, Kind, AccessTy))
+    if (reconcileNewOffset(LU, Offset, /*HasBaseReg=*/true, Expr->getType(),
+                           Kind, AccessTy)) {
       // Reuse this use.
       return std::make_pair(LUIdx, Offset);
+    }
   }
 
   // Create a new use.
@@ -3177,7 +3211,7 @@ static bool canFoldIVIncExpr(const SCEV *IncExpr, Instruction *UserInst,
   MemAccessTy AccessTy = getAccessType(TTI, UserInst, Operand);
   int64_t IncOffset = IncConst->getValue()->getSExtValue();
   if (!isAlwaysFoldable(TTI, LSRUse::Address, AccessTy, /*BaseGV=*/nullptr,
-                        IncOffset, /*HasBaseReg=*/false))
+                        IncOffset, /*HasBaseReg=*/false, /*BaseType=*/nullptr))
     return false;
 
   return true;
@@ -3407,6 +3441,7 @@ LSRInstance::InsertSupplementalFormula(const SCEV *S,
   Formula F;
   F.BaseRegs.push_back(S);
   F.HasBaseReg = true;
+  F.Ty = S->getType();
   bool Inserted = InsertFormula(LU, LUIdx, F);
   assert(Inserted && "Supplemental formula already exists!"); (void)Inserted;
 }
@@ -3822,17 +3857,26 @@ void LSRInstance::GenerateSymbolicOffsetsImpl(LSRUse &LU, unsigned LUIdx,
                                               bool IsScaledReg) {
   const SCEV *G = IsScaledReg ? Base.ScaledReg : Base.BaseRegs[Idx];
   GlobalValue *GV = ExtractSymbol(G, SE);
-  if (G->isZero() || !GV)
+  if (!GV)
     return;
+  if (G->isZero())
+    G = nullptr;
   Formula F = Base;
   F.BaseGV = GV;
-  if (!isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy, F))
-    return;
-  if (IsScaledReg)
+  if (IsScaledReg) {
     F.ScaledReg = G;
-  else
-    F.BaseRegs[Idx] = G;
-  (void)InsertFormula(LU, LUIdx, F);
+    if (!G)
+      F.Scale = 0;
+  } else {
+    if (G)
+      F.BaseRegs[Idx] = G;
+    else
+      F.BaseRegs.erase(F.BaseRegs.begin() + Idx);
+  }
+  F.canonicalize(*L);
+  if (isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy, F)) {
+    (void)InsertFormula(LU, LUIdx, F);
+  }
 }
 
 /// Generate reuse formulae using symbolic offsets.
@@ -3857,24 +3901,28 @@ void LSRInstance::GenerateConstantOffsetsImpl(
     Formula F = Base;
     F.BaseOffset = (uint64_t)Base.BaseOffset - Offset;
 
-    if (isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy, F)) {
-      // Add the offset to the base register.
-      const SCEV *NewG = SE.getAddExpr(SE.getConstant(G->getType(), Offset), G);
-      // If it cancelled out, drop the base register, otherwise update it.
-      if (NewG->isZero()) {
-        if (IsScaledReg) {
-          F.Scale = 0;
-          F.ScaledReg = nullptr;
-        } else
-          F.deleteBaseReg(F.BaseRegs[Idx]);
-        F.canonicalize(*L);
-      } else if (IsScaledReg)
-        F.ScaledReg = NewG;
-      else
-        F.BaseRegs[Idx] = NewG;
-
-      (void)InsertFormula(LU, LUIdx, F);
+    // Add the offset to the base register.
+    const SCEV *NewG = SE.getAddExpr(SE.getConstant(G->getType(), Offset), G);
+    if (SE.getTypeSizeInBits(G->getType()) < SE.getTypeSizeInBits(F.Ty)) {
+      // LLVM-MOS: Todo.
+      return;
     }
+
+    // If it cancelled out, drop the base register, otherwise update it.
+    if (NewG->isZero()) {
+      if (IsScaledReg) {
+        F.Scale = 0;
+        F.ScaledReg = nullptr;
+      } else
+        F.deleteBaseReg(F.BaseRegs[Idx]);
+      F.canonicalize(*L);
+    } else if (IsScaledReg)
+      F.ScaledReg = NewG;
+    else
+      F.BaseRegs[Idx] = NewG;
+
+    if (isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy, F))
+      (void)InsertFormula(LU, LUIdx, F);
   };
 
   const SCEV *G = IsScaledReg ? Base.ScaledReg : Base.BaseRegs[Idx];
@@ -3905,13 +3953,16 @@ void LSRInstance::GenerateConstantOffsetsImpl(
   for (int64_t Offset : Worklist)
     GenerateOffset(G, Offset);
 
+  if (SE.getTypeSizeInBits(G->getType()) < SE.getTypeSizeInBits(Base.Ty)) {
+    // LLVM-MOS: Todo.
+    return;
+  }
+
   int64_t Imm = ExtractImmediate(G, SE);
   if (G->isZero() || Imm == 0)
     return;
   Formula F = Base;
   F.BaseOffset = (uint64_t)F.BaseOffset + Imm;
-  if (!isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy, F))
-    return;
   if (IsScaledReg) {
     F.ScaledReg = G;
   } else {
@@ -3920,7 +3971,8 @@ void LSRInstance::GenerateConstantOffsetsImpl(
     // related with current loop while F.ScaledReg is not.
     F.canonicalize(*L);
   }
-  (void)InsertFormula(LU, LUIdx, F);
+  if (isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy, F))
+    (void)InsertFormula(LU, LUIdx, F);
 }
 
 /// GenerateConstantOffsets - Generate reuse formulae using symbolic offsets.
@@ -3947,7 +3999,7 @@ void LSRInstance::GenerateICmpZeroScales(LSRUse &LU, unsigned LUIdx,
   if (LU.Kind != LSRUse::ICmpZero) return;
 
   // Determine the integer type for the base formula.
-  Type *IntTy = Base.getType();
+  Type *IntTy = Base.Ty;
   if (!IntTy) return;
   if (SE.getTypeSizeInBits(IntTy) > 64) return;
 
@@ -3994,26 +4046,34 @@ void LSRInstance::GenerateICmpZeroScales(LSRUse &LU, unsigned LUIdx,
     Formula F = Base;
     F.BaseOffset = NewBaseOffset;
 
-    // Check that this scale is legal.
-    if (!isLegalUse(TTI, Offset, Offset, LU.Kind, LU.AccessTy, F))
-      continue;
-
     // Compensate for the use having MinOffset built into it.
     F.BaseOffset = (uint64_t)F.BaseOffset + Offset - LU.MinOffset;
 
-    const SCEV *FactorS = SE.getConstant(IntTy, Factor);
 
     // Check that multiplying with each base register doesn't overflow.
     for (size_t i = 0, e = F.BaseRegs.size(); i != e; ++i) {
+      const SCEV *FactorS = SE.getConstant(F.BaseRegs[i]->getType(), Factor);
       F.BaseRegs[i] = SE.getMulExpr(F.BaseRegs[i], FactorS);
       if (getExactSDiv(F.BaseRegs[i], FactorS, SE) != Base.BaseRegs[i])
+        goto next;
+      // Only implicit zero-extension from smaller types is supported.
+      if (SE.getTypeSizeInBits(F.BaseRegs[i]->getType()) <
+              SE.getTypeSizeInBits(F.Ty) &&
+          !SE.isKnownNonNegative(F.BaseRegs[i]))
         goto next;
     }
 
     // Check that multiplying with the scaled register doesn't overflow.
     if (F.ScaledReg) {
+      const SCEV *FactorS = SE.getConstant(F.ScaledReg->getType(), Factor);
       F.ScaledReg = SE.getMulExpr(F.ScaledReg, FactorS);
       if (getExactSDiv(F.ScaledReg, FactorS, SE) != Base.ScaledReg)
+        continue;
+
+      // Only implicit zero-extension from smaller types is supported.
+      if (SE.getTypeSizeInBits(F.ScaledReg->getType()) <
+              SE.getTypeSizeInBits(F.Ty) &&
+          !SE.isKnownNonNegative(F.ScaledReg))
         continue;
     }
 
@@ -4032,7 +4092,8 @@ void LSRInstance::GenerateICmpZeroScales(LSRUse &LU, unsigned LUIdx,
     }
 
     // If we make it here and it's legal, add it.
-    (void)InsertFormula(LU, LUIdx, F);
+    if (isLegalUse(TTI, Offset, Offset, LU.Kind, LU.AccessTy, F))
+      (void)InsertFormula(LU, LUIdx, F);
   next:;
   }
 }
@@ -4041,7 +4102,7 @@ void LSRInstance::GenerateICmpZeroScales(LSRUse &LU, unsigned LUIdx,
 /// modes, for example.
 void LSRInstance::GenerateScales(LSRUse &LU, unsigned LUIdx, Formula Base) {
   // Determine the integer type for the base formula.
-  Type *IntTy = Base.getType();
+  Type *IntTy = Base.Ty;
   if (!IntTy) return;
 
   // If this Formula already has a scaled register, we can't add another one.
@@ -4077,16 +4138,23 @@ void LSRInstance::GenerateScales(LSRUse &LU, unsigned LUIdx, Formula Base) {
     for (size_t i = 0, e = Base.BaseRegs.size(); i != e; ++i) {
       const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Base.BaseRegs[i]);
       if (AR && (AR->getLoop() == L || LU.AllFixupsOutsideLoop)) {
-        const SCEV *FactorS = SE.getConstant(IntTy, Factor);
+        const SCEV *FactorS = SE.getConstant(Base.BaseRegs[i]->getType(), Factor);
         if (FactorS->isZero())
           continue;
         // Divide out the factor, ignoring high bits, since we'll be
         // scaling the value back up in the end.
         if (const SCEV *Quotient = getExactSDiv(AR, FactorS, SE, true)) {
+          // We can only implicitly zero-extend.
+          if (SE.getTypeSizeInBits(Quotient->getType()) <
+                  SE.getTypeSizeInBits(Base.Ty) &&
+              !SE.isKnownNonNegative(Quotient))
+            continue;
+
           // TODO: This could be optimized to avoid all the copying.
           Formula F = Base;
           F.ScaledReg = Quotient;
           F.deleteBaseReg(F.BaseRegs[i]);
+
           // The canonical representation of 1*reg is reg, which is already in
           // Base. In that case, do not try to insert the formula, it will be
           // rejected anyway.
@@ -4110,7 +4178,7 @@ void LSRInstance::GenerateTruncates(LSRUse &LU, unsigned LUIdx, Formula Base) {
   if (Base.BaseGV) return;
 
   // Determine the integer type for the base formula.
-  Type *DstTy = Base.getType();
+  Type *DstTy = Base.Ty;
   if (!DstTy) return;
   if (DstTy->isPointerTy())
     return;
@@ -4126,6 +4194,7 @@ void LSRInstance::GenerateTruncates(LSRUse &LU, unsigned LUIdx, Formula Base) {
   for (Type *SrcTy : Types) {
     if (SrcTy != DstTy && TTI.isTruncateFree(SrcTy, DstTy)) {
       Formula F = Base;
+      F.Ty = SrcTy;
 
       // Sometimes SCEV is able to prove zero during ext transform. It may
       // happen if SCEV did not do all possible transforms while creating the
@@ -4158,6 +4227,71 @@ void LSRInstance::GenerateTruncates(LSRUse &LU, unsigned LUIdx, Formula Base) {
       (void)InsertFormula(LU, LUIdx, F);
     }
   }
+}
+
+void LSRInstance::GenerateZExts(LSRUse &LU, unsigned LUIdx, Formula Base) {
+  if (!Base.Ty)
+    return;
+
+  const auto &DL = SE.getDataLayout();
+  bool Changed = false;
+  auto Regs = Base.BaseRegs;
+  if (Base.Scale == 1)
+    Regs.push_back(Base.ScaledReg);
+  for (unsigned Idx = 0, EndIdx = Regs.size(); Idx != EndIdx; ++Idx) {
+    const auto *Reg = Regs[Idx];
+    Type *Ty = Reg->getType();
+    if (Ty->isPointerTy())
+      continue;
+
+    const auto Width = SE.getTypeSizeInBits(Ty);
+    if (DL.isLegalInteger(Width))
+      continue;
+
+    unsigned NarrowWidth = 0;
+
+    bool CannotNarrow = false;
+    for (const auto &Fixup : LU.Fixups) {
+      const auto *R = denormalizeForPostIncUse(Reg, Fixup.PostIncLoops, SE);
+      if (!SE.isKnownNonNegative(R)) {
+        CannotNarrow = true;
+        break;
+      }
+      const auto Range = SE.getUnsignedRange(R);
+      const unsigned NumActiveBytes = (Range.getActiveBits() + 7) / 8;
+      unsigned FixupNarrowWidth = NumActiveBytes * 8;
+      if (!FixupNarrowWidth) {
+        CannotNarrow = true;
+        break;
+      }
+      NarrowWidth = std::max(NarrowWidth, FixupNarrowWidth);
+    }
+    if (CannotNarrow)
+      continue;
+
+    if (!DL.isLegalInteger(NarrowWidth))
+      continue;
+
+    Type *NarrowTy = Type::getIntNTy(Ty->getContext(), NarrowWidth);
+    if (!TTI.isZExtFree(NarrowTy, Reg->getType()))
+      continue;
+
+    const auto *Narrow = SE.getTruncateExpr(Reg, NarrowTy);
+    if (Idx == Base.BaseRegs.size())
+      Base.ScaledReg = Narrow;
+    else
+      Base.BaseRegs[Idx] = Narrow;
+    Changed = true;
+  }
+  if (!Changed)
+    return;
+
+  if (!Base.BaseGV && !Base.BaseOffset && !Base.UnfoldedOffset &&
+      Base.getNumRegs() == 1)
+    Base.Ty = Base.BaseRegs[0]->getType();
+
+  Base.canonicalize(*L);
+  (void)InsertFormula(LU, LUIdx, Base);
 }
 
 namespace {
@@ -4288,6 +4422,7 @@ void LSRInstance::GenerateCrossUseConstantOffsets() {
     // TODO: Use a more targeted data structure.
     for (size_t L = 0, LE = LU.Formulae.size(); L != LE; ++L) {
       Formula F = LU.Formulae[L];
+
       // FIXME: The code for the scaled and unscaled registers looks
       // very similar but slightly different. Investigate if they
       // could be merged. That way, we would not have to unscale the
@@ -4302,9 +4437,12 @@ void LSRInstance::GenerateCrossUseConstantOffsets() {
           continue;
         Formula NewF = F;
         NewF.BaseOffset = Offset;
-        if (!isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy,
-                        NewF))
+
+        if (SE.getTypeSizeInBits(NewF.ScaledReg->getType()) <
+            SE.getTypeSizeInBits(F.Ty)) {
+          // LLVM-MOS: TODO
           continue;
+        }
         NewF.ScaledReg = SE.getAddExpr(NegImmS, NewF.ScaledReg);
 
         // If the new scale is a constant in a register, and adding the constant
@@ -4318,7 +4456,9 @@ void LSRInstance::GenerateCrossUseConstantOffsets() {
 
         // OK, looks good.
         NewF.canonicalize(*this->L);
-        (void)InsertFormula(LU, LUIdx, NewF);
+        if (isLegalUse(TTI, LU.MinOffset, LU.MaxOffset, LU.Kind, LU.AccessTy,
+                       NewF))
+          (void)InsertFormula(LU, LUIdx, NewF);
       } else {
         // Use the immediate in a base register.
         for (size_t N = 0, NE = F.BaseRegs.size(); N != NE; ++N) {
@@ -4336,6 +4476,11 @@ void LSRInstance::GenerateCrossUseConstantOffsets() {
               continue;
             NewF = F;
             NewF.UnfoldedOffset = (uint64_t)NewF.UnfoldedOffset + Imm;
+          }
+          if (SE.getTypeSizeInBits(BaseReg->getType()) <
+              SE.getTypeSizeInBits(F.Ty)) {
+            // LLVM-MOS: TODO
+            continue;
           }
           NewF.BaseRegs[N] = SE.getAddExpr(NegImmS, BaseReg);
 
@@ -4373,6 +4518,8 @@ LSRInstance::GenerateAllReuseFormulae() {
       GenerateReassociations(LU, LUIdx, LU.Formulae[i]);
     for (size_t i = 0, f = LU.Formulae.size(); i != f; ++i)
       GenerateCombinations(LU, LUIdx, LU.Formulae[i]);
+    for (size_t i = 0, f = LU.Formulae.size(); i != f; ++i)
+      GenerateZExts(LU, LUIdx, LU.Formulae[i]);
   }
   for (size_t LUIdx = 0, NumUses = Uses.size(); LUIdx != NumUses; ++LUIdx) {
     LSRUse &LU = Uses[LUIdx];
@@ -4605,8 +4752,8 @@ void LSRInstance::NarrowSearchSpaceByCollapsingUnrolledCode() {
       if (!LUThatHas)
         continue;
 
-      if (!reconcileNewOffset(*LUThatHas, F.BaseOffset, /*HasBaseReg=*/ false,
-                              LU.Kind, LU.AccessTy))
+      if (!reconcileNewOffset(*LUThatHas, F.BaseOffset, /*HasBaseReg=*/false,
+                              /*HasBaseType=*/nullptr, LU.Kind, LU.AccessTy))
         continue;
 
       LLVM_DEBUG(dbgs() << "  Deleting use "; LU.print(dbgs()); dbgs() << '\n');
@@ -5291,7 +5438,7 @@ Value *LSRInstance::Expand(const LSRUse &LU, const LSRFixup &LF,
   // This is the type that the user actually needs.
   Type *OpTy = LF.OperandValToReplace->getType();
   // This will be the type that we'll initially expand to.
-  Type *Ty = F.getType();
+  Type *Ty = F.Ty;
   if (!Ty)
     // No type known; just expand directly to the ultimate type.
     Ty = OpTy;
@@ -5310,7 +5457,7 @@ Value *LSRInstance::Expand(const LSRUse &LU, const LSRFixup &LF,
 
     // If we're expanding for a post-inc user, make the post-inc adjustment.
     Reg = denormalizeForPostIncUse(Reg, LF.PostIncLoops, SE);
-    Ops.push_back(SE.getUnknown(Rewriter.expandCodeFor(Reg, nullptr)));
+    Ops.push_back(SE.getNoopOrZeroExtend(SE.getUnknown(Rewriter.expandCodeFor(Reg, nullptr)), IntTy));
   }
 
   // Expand the ScaledReg portion.
@@ -5325,8 +5472,9 @@ Value *LSRInstance::Expand(const LSRUse &LU, const LSRFixup &LF,
     if (LU.Kind == LSRUse::ICmpZero) {
       // Expand ScaleReg as if it was part of the base regs.
       if (F.Scale == 1)
-        Ops.push_back(
-            SE.getUnknown(Rewriter.expandCodeFor(ScaledS, nullptr)));
+        Ops.push_back(SE.getNoopOrZeroExtend(SE.getUnknown(
+                          Rewriter.expandCodeFor(ScaledS, nullptr)),
+                      IntTy));
       else {
         // An interesting way of "folding" with an icmp is to use a negated
         // scale, which we'll implement by inserting it into the other operand
@@ -5347,7 +5495,8 @@ Value *LSRInstance::Expand(const LSRUse &LU, const LSRFixup &LF,
         Ops.clear();
         Ops.push_back(SE.getUnknown(FullV));
       }
-      ScaledS = SE.getUnknown(Rewriter.expandCodeFor(ScaledS, nullptr));
+      ScaledS = SE.getNoopOrZeroExtend(
+          SE.getUnknown(Rewriter.expandCodeFor(ScaledS, nullptr)), IntTy);
       if (F.Scale != 1)
         ScaledS =
             SE.getMulExpr(ScaledS, SE.getConstant(ScaledS->getType(), F.Scale));
@@ -5383,7 +5532,7 @@ Value *LSRInstance::Expand(const LSRUse &LU, const LSRFixup &LF,
       if (!ICmpScaledV)
         ICmpScaledV = ConstantInt::get(IntTy, -(uint64_t)Offset);
       else {
-        Ops.push_back(SE.getUnknown(ICmpScaledV));
+        Ops.push_back(SE.getNoopOrZeroExtend(SE.getUnknown(ICmpScaledV), IntTy));
         ICmpScaledV = ConstantInt::get(IntTy, Offset);
       }
     } else {
@@ -5434,7 +5583,7 @@ Value *LSRInstance::Expand(const LSRUse &LU, const LSRFixup &LF,
       assert((F.Scale == 0 || F.Scale == 1) &&
              "ICmp does not support folding a global value and "
              "a scale at the same time!");
-      Constant *C = ConstantInt::getSigned(SE.getEffectiveSCEVType(OpTy),
+      Constant *C = ConstantInt::getSigned(SE.getEffectiveSCEVType(IntTy),
                                            -(uint64_t)Offset);
       if (C->getType() != OpTy)
         C = ConstantExpr::getCast(CastInst::getCastOpcode(C, false,
@@ -5600,6 +5749,27 @@ void LSRInstance::Rewrite(const LSRUse &LU, const LSRFixup &LF,
 
   if (auto *OperandIsInstr = dyn_cast<Instruction>(LF.OperandValToReplace))
     DeadInsts.emplace_back(OperandIsInstr);
+}
+
+// Check if there are any loop exit values which are only used once within the
+// loop which may potentially be optimized with a call to rewriteLoopExitValue.
+static bool LoopExitValHasSingleUse(Loop *L) {
+  BasicBlock *ExitBB = L->getExitBlock();
+  if (!ExitBB)
+    return false;
+
+  for (PHINode &ExitPhi : ExitBB->phis()) {
+    if (ExitPhi.getNumIncomingValues() != 1)
+      break;
+
+    BasicBlock *Pred = ExitPhi.getIncomingBlock(0);
+    Value *IVNext = ExitPhi.getIncomingValueForBlock(Pred);
+    // One use would be the exit phi node, and there should be only one other
+    // use for this to be considered.
+    if (IVNext->getNumUses() == 2)
+      return true;
+  }
+  return false;
 }
 
 /// Rewrite all the fixup locations with new values, following the chosen
@@ -5895,40 +6065,57 @@ void LoopStrengthReduce::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 namespace {
+
+/// Enables more convenient iteration over a DWARF expression vector.
+static iterator_range<llvm::DIExpression::expr_op_iterator>
+ToDwarfOpIter(SmallVectorImpl<uint64_t> &Expr) {
+  llvm::DIExpression::expr_op_iterator Begin =
+      llvm::DIExpression::expr_op_iterator(Expr.begin());
+  llvm::DIExpression::expr_op_iterator End =
+      llvm::DIExpression::expr_op_iterator(Expr.end());
+  return {Begin, End};
+}
+
 struct SCEVDbgValueBuilder {
   SCEVDbgValueBuilder() = default;
-  SCEVDbgValueBuilder(const SCEVDbgValueBuilder &Base) {
-    Values = Base.Values;
+  SCEVDbgValueBuilder(const SCEVDbgValueBuilder &Base) { clone(Base); }
+
+  void clone(const SCEVDbgValueBuilder &Base) {
+    LocationOps = Base.LocationOps;
     Expr = Base.Expr;
+  }
+
+  void clear() {
+    LocationOps.clear();
+    Expr.clear();
   }
 
   /// The DIExpression as we translate the SCEV.
   SmallVector<uint64_t, 6> Expr;
   /// The location ops of the DIExpression.
-  SmallVector<llvm::ValueAsMetadata *, 2> Values;
+  SmallVector<Value *, 2> LocationOps;
 
   void pushOperator(uint64_t Op) { Expr.push_back(Op); }
   void pushUInt(uint64_t Operand) { Expr.push_back(Operand); }
 
   /// Add a DW_OP_LLVM_arg to the expression, followed by the index of the value
   /// in the set of values referenced by the expression.
-  void pushValue(llvm::Value *V) {
+  void pushLocation(llvm::Value *V) {
     Expr.push_back(llvm::dwarf::DW_OP_LLVM_arg);
-    auto *It =
-        std::find(Values.begin(), Values.end(), llvm::ValueAsMetadata::get(V));
+    auto *It = std::find(LocationOps.begin(), LocationOps.end(), V);
     unsigned ArgIndex = 0;
-    if (It != Values.end()) {
-      ArgIndex = std::distance(Values.begin(), It);
+    if (It != LocationOps.end()) {
+      ArgIndex = std::distance(LocationOps.begin(), It);
     } else {
-      ArgIndex = Values.size();
-      Values.push_back(llvm::ValueAsMetadata::get(V));
+      ArgIndex = LocationOps.size();
+      LocationOps.push_back(V);
     }
     Expr.push_back(ArgIndex);
   }
 
   void pushValue(const SCEVUnknown *U) {
     llvm::Value *V = cast<SCEVUnknown>(U)->getValue();
-    pushValue(V);
+    pushLocation(V);
   }
 
   bool pushConst(const SCEVConstant *C) {
@@ -5937,6 +6124,12 @@ struct SCEVDbgValueBuilder {
     Expr.push_back(llvm::dwarf::DW_OP_consts);
     Expr.push_back(C->getAPInt().getSExtValue());
     return true;
+  }
+
+  // Iterating the expression as DWARF ops is convenient when updating
+  // DWARF_OP_LLVM_args.
+  iterator_range<llvm::DIExpression::expr_op_iterator> expr_ops() {
+    return ToDwarfOpIter(Expr);
   }
 
   /// Several SCEV types are sequences of the same arithmetic operator applied
@@ -5980,7 +6173,7 @@ struct SCEVDbgValueBuilder {
     } else if (const SCEVUnknown *U = dyn_cast<SCEVUnknown>(S)) {
       if (!U->getValue())
         return false;
-      pushValue(U->getValue());
+      pushLocation(U->getValue());
 
     } else if (const SCEVMulExpr *MulRec = dyn_cast<SCEVMulExpr>(S)) {
       Success &= pushArithmeticExpr(MulRec, llvm::dwarf::DW_OP_mul);
@@ -6009,52 +6202,6 @@ struct SCEVDbgValueBuilder {
       return false;
     }
     return Success;
-  }
-
-  void setFinalExpression(llvm::DbgValueInst &DI, const DIExpression *OldExpr) {
-    // Re-state assumption that this dbg.value is not variadic. Any remaining
-    // opcodes in its expression operate on a single value already on the
-    // expression stack. Prepend our operations, which will re-compute and
-    // place that value on the expression stack.
-    assert(!DI.hasArgList());
-    auto *NewExpr =
-        DIExpression::prependOpcodes(OldExpr, Expr, /*StackValue*/ true);
-    DI.setExpression(NewExpr);
-
-    auto ValArrayRef = llvm::ArrayRef<llvm::ValueAsMetadata *>(Values);
-    DI.setRawLocation(llvm::DIArgList::get(DI.getContext(), ValArrayRef));
-  }
-
-  /// If a DVI can be emitted without a DIArgList, omit DW_OP_llvm_arg and the
-  /// location op index 0.
-  void setShortFinalExpression(llvm::DbgValueInst &DI,
-                               const DIExpression *OldExpr) {
-    assert((Expr[0] == llvm::dwarf::DW_OP_LLVM_arg && Expr[1] == 0) &&
-           "Expected DW_OP_llvm_arg and 0.");
-    DI.replaceVariableLocationOp(
-        0u, llvm::MetadataAsValue::get(DI.getContext(), Values[0]));
-
-    // See setFinalExpression: prepend our opcodes on the start of any old
-    // expression opcodes.
-    assert(!DI.hasArgList());
-    llvm::SmallVector<uint64_t, 6> FinalExpr(llvm::drop_begin(Expr, 2));
-    auto *NewExpr =
-        DIExpression::prependOpcodes(OldExpr, FinalExpr, /*StackValue*/ true);
-    DI.setExpression(NewExpr);
-  }
-
-  /// Once the IV and variable SCEV translation is complete, write it to the
-  /// source DVI.
-  void applyExprToDbgValue(llvm::DbgValueInst &DI,
-                           const DIExpression *OldExpr) {
-    assert(!Expr.empty() && "Unexpected empty expression.");
-    // Emit a simpler form if only a single location is referenced.
-    if (Values.size() == 1 && Expr[0] == llvm::dwarf::DW_OP_LLVM_arg &&
-        Expr[1] == 0) {
-      setShortFinalExpression(DI, OldExpr);
-    } else {
-      setFinalExpression(DI, OldExpr);
-    }
   }
 
   /// Return true if the combination of arithmetic operator and underlying
@@ -6105,6 +6252,48 @@ struct SCEVDbgValueBuilder {
     return true;
   }
 
+  /// Create an expression that is an offset from a value (usually the IV).
+  void createOffsetExpr(int64_t Offset, Value *OffsetValue) {
+    pushLocation(OffsetValue);
+    DIExpression::appendOffset(Expr, Offset);
+    LLVM_DEBUG(
+        dbgs() << "scev-salvage: Generated IV offset expression. Offset: "
+               << std::to_string(Offset) << "\n");
+  }
+
+  /// Combine a translation of the SCEV and the IV to create an expression that
+  /// recovers a location's value.
+  /// returns true if an expression was created.
+  bool createIterCountExpr(const SCEV *S,
+                           const SCEVDbgValueBuilder &IterationCount,
+                           ScalarEvolution &SE) {
+    // SCEVs for SSA values are most frquently of the form
+    // {start,+,stride}, but sometimes they are ({start,+,stride} + %a + ..).
+    // This is because %a is a PHI node that is not the IV. However, these
+    // SCEVs have not been observed to result in debuginfo-lossy optimisations,
+    // so its not expected this point will be reached.
+    if (!isa<SCEVAddRecExpr>(S))
+      return false;
+
+    LLVM_DEBUG(dbgs() << "scev-salvage: Location to salvage SCEV: " << *S
+                      << '\n');
+
+    const auto *Rec = cast<SCEVAddRecExpr>(S);
+    if (!Rec->isAffine())
+      return false;
+
+    if (S->getExpressionSize() > MaxSCEVSalvageExpressionSize)
+      return false;
+
+    // Initialise a new builder with the iteration count expression. In
+    // combination with the value's SCEV this enables recovery.
+    clone(IterationCount);
+    if (!SCEVToValueExpr(*Rec, SE))
+      return false;
+
+    return true;
+  }
+
   /// Convert a SCEV of a value to a DIExpression that is pushed onto the
   /// builder's expression stack. The stack should already contain an
   /// expression for the iteration count, so that it can be multiplied by
@@ -6134,74 +6323,294 @@ struct SCEVDbgValueBuilder {
     }
     return true;
   }
+
+  // Append the current expression and locations to a location list and an
+  // expression list. Modify the DW_OP_LLVM_arg indexes to account for
+  // the locations already present in the destination list.
+  void appendToVectors(SmallVectorImpl<uint64_t> &DestExpr,
+                       SmallVectorImpl<Value *> &DestLocations) {
+    assert(!DestLocations.empty() &&
+           "Expected the locations vector to contain the IV");
+    // The DWARF_OP_LLVM_arg arguments of the expression being appended must be
+    // modified to account for the locations already in the destination vector.
+    // All builders contain the IV as the first location op.
+    assert(!LocationOps.empty() &&
+           "Expected the location ops to contain the IV.");
+    // DestIndexMap[n] contains the index in DestLocations for the nth
+    // location in this SCEVDbgValueBuilder.
+    SmallVector<uint64_t, 2> DestIndexMap;
+    for (const auto &Op : LocationOps) {
+      auto It = find(DestLocations, Op);
+      if (It != DestLocations.end()) {
+        // Location already exists in DestLocations, reuse existing ArgIndex.
+        DestIndexMap.push_back(std::distance(DestLocations.begin(), It));
+        continue;
+      }
+      // Location is not in DestLocations, add it.
+      DestIndexMap.push_back(DestLocations.size());
+      DestLocations.push_back(Op);
+    }
+
+    for (const auto &Op : expr_ops()) {
+      if (Op.getOp() != dwarf::DW_OP_LLVM_arg) {
+        Op.appendToVector(DestExpr);
+        continue;
+      } 
+
+      DestExpr.push_back(dwarf::DW_OP_LLVM_arg);
+      // `DW_OP_LLVM_arg n` represents the nth LocationOp in this SCEV,
+      // DestIndexMap[n] contains its new index in DestLocations.
+      uint64_t NewIndex = DestIndexMap[Op.getArg(0)];
+      DestExpr.push_back(NewIndex);
+    }
+  }
 };
 
+/// Holds all the required data to salvage a dbg.value using the pre-LSR SCEVs
+/// and DIExpression.
 struct DVIRecoveryRec {
+  DVIRecoveryRec(DbgValueInst *DbgValue)
+      : DVI(DbgValue), Expr(DbgValue->getExpression()),
+        HadLocationArgList(false) {}
+
   DbgValueInst *DVI;
   DIExpression *Expr;
-  Metadata *LocationOp;
-  const llvm::SCEV *SCEV;
+  bool HadLocationArgList;
+  SmallVector<WeakVH, 2> LocationOps;
+  SmallVector<const llvm::SCEV *, 2> SCEVs;
+  SmallVector<std::unique_ptr<SCEVDbgValueBuilder>, 2> RecoveryExprs;
+
+  void clear() {
+    for (auto &RE : RecoveryExprs)
+      RE.reset();
+    RecoveryExprs.clear();
+  }
+
+  ~DVIRecoveryRec() { clear(); }
 };
 } // namespace
 
-static void RewriteDVIUsingIterCount(DVIRecoveryRec CachedDVI,
-                                     const SCEVDbgValueBuilder &IterationCount,
-                                     ScalarEvolution &SE) {
-  // LSR may add locations to previously single location-op DVIs which
-  // are currently not supported.
-  if (CachedDVI.DVI->getNumVariableLocationOps() != 1)
-    return;
-
-  // SCEVs for SSA values are most frquently of the form
-  // {start,+,stride}, but sometimes they are ({start,+,stride} + %a + ..).
-  // This is because %a is a PHI node that is not the IV. However, these
-  // SCEVs have not been observed to result in debuginfo-lossy optimisations,
-  // so its not expected this point will be reached.
-  if (!isa<SCEVAddRecExpr>(CachedDVI.SCEV))
-    return;
-
-  LLVM_DEBUG(dbgs() << "scev-salvage: Value to salvage SCEV: "
-                    << *CachedDVI.SCEV << '\n');
-
-  const auto *Rec = cast<SCEVAddRecExpr>(CachedDVI.SCEV);
-  if (!Rec->isAffine())
-    return;
-
-  if (CachedDVI.SCEV->getExpressionSize() > MaxSCEVSalvageExpressionSize)
-    return;
-
-  // Initialise a new builder with the iteration count expression. In
-  // combination with the value's SCEV this enables recovery.
-  SCEVDbgValueBuilder RecoverValue(IterationCount);
-  if (!RecoverValue.SCEVToValueExpr(*Rec, SE))
-    return;
-
-  LLVM_DEBUG(dbgs() << "scev-salvage: Updating: " << *CachedDVI.DVI << '\n');
-  RecoverValue.applyExprToDbgValue(*CachedDVI.DVI, CachedDVI.Expr);
-  LLVM_DEBUG(dbgs() << "scev-salvage: to: " << *CachedDVI.DVI << '\n');
+/// Returns the total number of DW_OP_llvm_arg operands in the expression.
+/// This helps in determining if a DIArglist is necessary or can be omitted from
+/// the dbg.value.
+static unsigned numLLVMArgOps(SmallVectorImpl<uint64_t> &Expr) {
+  auto expr_ops = ToDwarfOpIter(Expr);
+  unsigned Count = 0;
+  for (auto Op : expr_ops)
+    if (Op.getOp() == dwarf::DW_OP_LLVM_arg)
+      Count++;
+  return Count;
 }
 
-static void RewriteDVIUsingOffset(DVIRecoveryRec &DVIRec, llvm::PHINode &IV,
-                                  int64_t Offset) {
-  assert(!DVIRec.DVI->hasArgList() && "Expected single location-op dbg.value.");
-  DbgValueInst *DVI = DVIRec.DVI;
-  SmallVector<uint64_t, 8> Ops;
-  DIExpression::appendOffset(Ops, Offset);
-  DIExpression *Expr = DIExpression::prependOpcodes(DVIRec.Expr, Ops, true);
-  LLVM_DEBUG(dbgs() << "scev-salvage: Updating: " << *DVIRec.DVI << '\n');
-  DVI->setExpression(Expr);
-  llvm::Value *ValIV = dyn_cast<llvm::Value>(&IV);
-  DVI->replaceVariableLocationOp(
-      0u, llvm::MetadataAsValue::get(DVI->getContext(),
-                                     llvm::ValueAsMetadata::get(ValIV)));
-  LLVM_DEBUG(dbgs() << "scev-salvage: updated with offset to IV: "
-                    << *DVIRec.DVI << '\n');
+/// Overwrites DVI with the location and Ops as the DIExpression. This will
+/// create an invalid expression if Ops has any dwarf::DW_OP_llvm_arg operands,
+/// because a DIArglist is not created for the first argument of the dbg.value.
+static void updateDVIWithLocation(DbgValueInst &DVI, Value *Location,
+                                  SmallVectorImpl<uint64_t> &Ops) {
+  assert(
+      numLLVMArgOps(Ops) == 0 &&
+      "Expected expression that does not contain any DW_OP_llvm_arg operands.");
+  DVI.setRawLocation(ValueAsMetadata::get(Location));
+  DVI.setExpression(DIExpression::get(DVI.getContext(), Ops));
 }
 
+/// Overwrite DVI with locations placed into a DIArglist.
+static void updateDVIWithLocations(DbgValueInst &DVI,
+                                   SmallVectorImpl<Value *> &Locations,
+                                   SmallVectorImpl<uint64_t> &Ops) {
+  assert(numLLVMArgOps(Ops) != 0 &&
+         "Expected expression that references DIArglist locations using "
+         "DW_OP_llvm_arg operands.");
+  SmallVector<ValueAsMetadata *, 3> MetadataLocs;
+  for (Value *V : Locations)
+    MetadataLocs.push_back(ValueAsMetadata::get(V));
+  auto ValArrayRef = llvm::ArrayRef<llvm::ValueAsMetadata *>(MetadataLocs);
+  DVI.setRawLocation(llvm::DIArgList::get(DVI.getContext(), ValArrayRef));
+  DVI.setExpression(DIExpression::get(DVI.getContext(), Ops));
+}
+
+/// Write the new expression and new location ops for the dbg.value. If possible
+/// reduce the szie of the dbg.value intrinsic by omitting DIArglist. This
+/// can be omitted if:
+/// 1. There is only a single location, refenced by a single DW_OP_llvm_arg.
+/// 2. The DW_OP_LLVM_arg is the first operand in the expression.
+static void UpdateDbgValueInst(DVIRecoveryRec &DVIRec,
+                               SmallVectorImpl<Value *> &NewLocationOps,
+                               SmallVectorImpl<uint64_t> &NewExpr) {
+  unsigned NumLLVMArgs = numLLVMArgOps(NewExpr);
+  if (NumLLVMArgs == 0) {
+    // Location assumed to be on the stack.
+    updateDVIWithLocation(*DVIRec.DVI, NewLocationOps[0], NewExpr);
+  } else if (NumLLVMArgs == 1 && NewExpr[0] == dwarf::DW_OP_LLVM_arg) {
+    // There is only a single DW_OP_llvm_arg at the start of the expression,
+    // so it can be omitted along with DIArglist.
+    assert(NewExpr[1] == 0 &&
+           "Lone LLVM_arg in a DIExpression should refer to location-op 0.");
+    llvm::SmallVector<uint64_t, 6> ShortenedOps(llvm::drop_begin(NewExpr, 2));
+    updateDVIWithLocation(*DVIRec.DVI, NewLocationOps[0], ShortenedOps);
+  } else {
+    // Multiple DW_OP_llvm_arg, so DIArgList is strictly necessary.
+    updateDVIWithLocations(*DVIRec.DVI, NewLocationOps, NewExpr);
+  }
+
+  // If the DIExpression was previously empty then add the stack terminator.
+  // Non-empty expressions have only had elements inserted into them and so the
+  // terminator should already be present e.g. stack_value or fragment.
+  DIExpression *SalvageExpr = DVIRec.DVI->getExpression();
+  if (!DVIRec.Expr->isComplex() && SalvageExpr->isComplex()) {
+    SalvageExpr = DIExpression::append(SalvageExpr, {dwarf::DW_OP_stack_value});
+    DVIRec.DVI->setExpression(SalvageExpr);
+  }
+}
+
+/// Cached location ops may be erased during LSR, in which case an undef is
+/// required when restoring from the cache. The type of that location is no
+/// longer available, so just use int8. The undef will be replaced by one or
+/// more locations later when a SCEVDbgValueBuilder selects alternative
+/// locations to use for the salvage.
+static Value *getValueOrUndef(WeakVH &VH, LLVMContext &C) {
+  return (VH) ? VH : UndefValue::get(llvm::Type::getInt8Ty(C));
+}
+
+/// Restore the DVI's pre-LSR arguments. Substitute undef for any erased values.
+static void restorePreTransformState(DVIRecoveryRec &DVIRec) {
+  LLVM_DEBUG(dbgs() << "scev-salvage: restore dbg.value to pre-LSR state\n"
+                    << "scev-salvage: post-LSR: " << *DVIRec.DVI << '\n');
+  assert(DVIRec.Expr && "Expected an expression");
+  DVIRec.DVI->setExpression(DVIRec.Expr);
+
+  // Even a single location-op may be inside a DIArgList and referenced with
+  // DW_OP_LLVM_arg, which is valid only with a DIArgList.
+  if (!DVIRec.HadLocationArgList) {
+    assert(DVIRec.LocationOps.size() == 1 &&
+           "Unexpected number of location ops.");
+    // LSR's unsuccessful salvage attempt may have added DIArgList, which in
+    // this case was not present before, so force the location back to a single
+    // uncontained Value.
+    Value *CachedValue =
+        getValueOrUndef(DVIRec.LocationOps[0], DVIRec.DVI->getContext());
+    DVIRec.DVI->setRawLocation(ValueAsMetadata::get(CachedValue));
+  } else {
+    SmallVector<ValueAsMetadata *, 3> MetadataLocs;
+    for (WeakVH VH : DVIRec.LocationOps) {
+      Value *CachedValue = getValueOrUndef(VH, DVIRec.DVI->getContext());
+      MetadataLocs.push_back(ValueAsMetadata::get(CachedValue));
+    }
+    auto ValArrayRef = llvm::ArrayRef<llvm::ValueAsMetadata *>(MetadataLocs);
+    DVIRec.DVI->setRawLocation(
+        llvm::DIArgList::get(DVIRec.DVI->getContext(), ValArrayRef));
+  }
+  LLVM_DEBUG(dbgs() << "scev-salvage: pre-LSR: " << *DVIRec.DVI << '\n');
+}
+
+static bool SalvageDVI(llvm::Loop *L, ScalarEvolution &SE,
+                       llvm::PHINode *LSRInductionVar, DVIRecoveryRec &DVIRec,
+                       const SCEV *SCEVInductionVar,
+                       SCEVDbgValueBuilder IterCountExpr) {
+  if (!DVIRec.DVI->isUndef())
+    return false;
+
+  // LSR may have caused several changes to the dbg.value in the failed salvage
+  // attempt. So restore the DIExpression, the location ops and also the
+  // location ops format, which is always DIArglist for multiple ops, but only
+  // sometimes for a single op.
+  restorePreTransformState(DVIRec);
+
+  // LocationOpIndexMap[i] will store the post-LSR location index of
+  // the non-optimised out location at pre-LSR index i.
+  SmallVector<int64_t, 2> LocationOpIndexMap;
+  LocationOpIndexMap.assign(DVIRec.LocationOps.size(), -1);
+  SmallVector<Value *, 2> NewLocationOps;
+  NewLocationOps.push_back(LSRInductionVar);
+
+  for (unsigned i = 0; i < DVIRec.LocationOps.size(); i++) {
+    WeakVH VH = DVIRec.LocationOps[i];
+    // Place the locations not optimised out in the list first, avoiding
+    // inserts later. The map is used to update the DIExpression's
+    // DW_OP_LLVM_arg arguments as the expression is updated.
+    if (VH && !isa<UndefValue>(VH)) {
+      NewLocationOps.push_back(VH);
+      LocationOpIndexMap[i] = NewLocationOps.size() - 1;
+      LLVM_DEBUG(dbgs() << "scev-salvage: Location index " << i
+                        << " now at index " << LocationOpIndexMap[i] << "\n");
+      continue;
+    }
+
+    // It's possible that a value referred to in the SCEV may have been
+    // optimised out by LSR.
+    if (SE.containsErasedValue(DVIRec.SCEVs[i]) ||
+        SE.containsUndefs(DVIRec.SCEVs[i])) {
+      LLVM_DEBUG(dbgs() << "scev-salvage: SCEV for location at index: " << i
+                        << " refers to a location that is now undef or erased. "
+                           "Salvage abandoned.\n");
+      return false;
+    }
+
+    LLVM_DEBUG(dbgs() << "scev-salvage: salvaging location at index " << i
+                      << " with SCEV: " << *DVIRec.SCEVs[i] << "\n");
+
+    DVIRec.RecoveryExprs[i] = std::make_unique<SCEVDbgValueBuilder>();
+    SCEVDbgValueBuilder *SalvageExpr = DVIRec.RecoveryExprs[i].get();
+
+    // Create an offset-based salvage expression if possible, as it requires
+    // less DWARF ops than an iteration count-based expression.
+    if (Optional<APInt> Offset =
+            SE.computeConstantDifference(DVIRec.SCEVs[i], SCEVInductionVar)) {
+      if (Offset.getValue().getMinSignedBits() <= 64)
+        SalvageExpr->createOffsetExpr(Offset.getValue().getSExtValue(),
+                                      LSRInductionVar);
+    } else if (!SalvageExpr->createIterCountExpr(DVIRec.SCEVs[i], IterCountExpr,
+                                                 SE))
+      return false;
+  }
+
+  // Merge the DbgValueBuilder generated expressions and the original
+  // DIExpression, place the result into an new vector.
+  SmallVector<uint64_t, 3> NewExpr;
+  if (DVIRec.Expr->getNumElements() == 0) {
+    assert(DVIRec.RecoveryExprs.size() == 1 &&
+           "Expected only a single recovery expression for an empty "
+           "DIExpression.");
+    assert(DVIRec.RecoveryExprs[0] &&
+           "Expected a SCEVDbgSalvageBuilder for location 0");
+    SCEVDbgValueBuilder *B = DVIRec.RecoveryExprs[0].get();
+    B->appendToVectors(NewExpr, NewLocationOps);
+  }
+  for (const auto &Op : DVIRec.Expr->expr_ops()) {
+    // Most Ops needn't be updated.
+    if (Op.getOp() != dwarf::DW_OP_LLVM_arg) {
+      Op.appendToVector(NewExpr);
+      continue;
+    }
+
+    uint64_t LocationArgIndex = Op.getArg(0);
+    SCEVDbgValueBuilder *DbgBuilder =
+        DVIRec.RecoveryExprs[LocationArgIndex].get();
+    // The location doesn't have s SCEVDbgValueBuilder, so LSR did not
+    // optimise it away. So just translate the argument to the updated
+    // location index.
+    if (!DbgBuilder) {
+      NewExpr.push_back(dwarf::DW_OP_LLVM_arg);
+      assert(LocationOpIndexMap[Op.getArg(0)] != -1 &&
+             "Expected a positive index for the location-op position.");
+      NewExpr.push_back(LocationOpIndexMap[Op.getArg(0)]);
+      continue;
+    }
+    // The location has a recovery expression.
+    DbgBuilder->appendToVectors(NewExpr, NewLocationOps);
+  }
+
+  UpdateDbgValueInst(DVIRec, NewLocationOps, NewExpr);
+  LLVM_DEBUG(dbgs() << "scev-salvage: Updated DVI: " << *DVIRec.DVI << "\n");
+  return true;
+}
+
+/// Obtain an expression for the iteration count, then attempt to salvage the
+/// dbg.value intrinsics.
 static void
 DbgRewriteSalvageableDVIs(llvm::Loop *L, ScalarEvolution &SE,
                           llvm::PHINode *LSRInductionVar,
-                          SmallVector<DVIRecoveryRec, 2> &DVIToUpdate) {
+                          SmallVector<std::unique_ptr<DVIRecoveryRec>, 2> &DVIToUpdate) {
   if (DVIToUpdate.empty())
     return;
 
@@ -6214,49 +6623,22 @@ DbgRewriteSalvageableDVIs(llvm::Loop *L, ScalarEvolution &SE,
     if (!IVAddRec->isAffine())
       return;
 
+    // Prevent translation using excessive resources.
     if (IVAddRec->getExpressionSize() > MaxSCEVSalvageExpressionSize)
       return;
 
     // The iteration count is required to recover location values.
     SCEVDbgValueBuilder IterCountExpr;
-    IterCountExpr.pushValue(LSRInductionVar);
+    IterCountExpr.pushLocation(LSRInductionVar);
     if (!IterCountExpr.SCEVToIterCountExpr(*IVAddRec, SE))
       return;
 
     LLVM_DEBUG(dbgs() << "scev-salvage: IV SCEV: " << *SCEVInductionVar
                       << '\n');
 
-    // Needn't salvage if the location op hasn't been undef'd by LSR.
     for (auto &DVIRec : DVIToUpdate) {
-      if (!DVIRec.DVI->isUndef())
-        continue;
-
-      // Some DVIs that were single location-op when cached are now multi-op,
-      // due to LSR optimisations. However, multi-op salvaging is not yet
-      // supported by SCEV salvaging. But, we can attempt a salvage by restoring
-      // the pre-LSR single-op expression.
-      if (DVIRec.DVI->hasArgList()) {
-        if (!DVIRec.DVI->getVariableLocationOp(0))
-          continue;
-        llvm::Type *Ty = DVIRec.DVI->getVariableLocationOp(0)->getType();
-        DVIRec.DVI->setRawLocation(
-            llvm::ValueAsMetadata::get(UndefValue::get(Ty)));
-        DVIRec.DVI->setExpression(DVIRec.Expr);
-      }
-
-      LLVM_DEBUG(dbgs() << "scev-salvage: value to recover SCEV: "
-                        << *DVIRec.SCEV << '\n');
-
-      // Create a simple expression if the IV and value to salvage SCEVs
-      // start values differ by only a constant value.
-      if (Optional<APInt> Offset =
-              SE.computeConstantDifference(DVIRec.SCEV, SCEVInductionVar)) {
-        if (Offset.getValue().getMinSignedBits() <= 64)
-          RewriteDVIUsingOffset(DVIRec, *LSRInductionVar,
-                                Offset.getValue().getSExtValue());
-      } else {
-        RewriteDVIUsingIterCount(DVIRec, IterCountExpr, SE);
-      }
+      SalvageDVI(L, SE, LSRInductionVar, *DVIRec, SCEVInductionVar,
+                 IterCountExpr);
     }
   }
 }
@@ -6264,39 +6646,53 @@ DbgRewriteSalvageableDVIs(llvm::Loop *L, ScalarEvolution &SE,
 /// Identify and cache salvageable DVI locations and expressions along with the
 /// corresponding SCEV(s). Also ensure that the DVI is not deleted between
 /// cacheing and salvaging.
-static void
-DbgGatherSalvagableDVI(Loop *L, ScalarEvolution &SE,
-                       SmallVector<DVIRecoveryRec, 2> &SalvageableDVISCEVs,
-                       SmallSet<AssertingVH<DbgValueInst>, 2> &DVIHandles) {
+static void DbgGatherSalvagableDVI(
+    Loop *L, ScalarEvolution &SE,
+    SmallVector<std::unique_ptr<DVIRecoveryRec>, 2> &SalvageableDVISCEVs,
+    SmallSet<AssertingVH<DbgValueInst>, 2> &DVIHandles) {
   for (auto &B : L->getBlocks()) {
     for (auto &I : *B) {
       auto DVI = dyn_cast<DbgValueInst>(&I);
       if (!DVI)
         continue;
-
+      // Ensure that if any location op is undef that the dbg.vlue is not
+      // cached.
       if (DVI->isUndef())
         continue;
 
-      if (DVI->hasArgList())
+      // Check that the location op SCEVs are suitable for translation to
+      // DIExpression.
+      const auto &HasTranslatableLocationOps =
+          [&](const DbgValueInst *DVI) -> bool {
+        for (const auto LocOp : DVI->location_ops()) {
+          if (!LocOp)
+            return false;
+
+          if (!SE.isSCEVable(LocOp->getType()))
+            return false;
+
+          const SCEV *S = SE.getSCEV(LocOp);
+          if (SE.containsUndefs(S))
+            return false;
+        }
+        return true;
+      };
+
+      if (!HasTranslatableLocationOps(DVI))
         continue;
 
-      if (!DVI->getVariableLocationOp(0) ||
-          !SE.isSCEVable(DVI->getVariableLocationOp(0)->getType()))
-        continue;
-
-      // SCEVUnknown wraps an llvm::Value, it does not have a start and stride.
-      // Therefore no translation to DIExpression is performed.
-      const SCEV *S = SE.getSCEV(DVI->getVariableLocationOp(0));
-      if (isa<SCEVUnknown>(S))
-        continue;
-
-      // Avoid wasting resources generating an expression containing undef.
-      if (SE.containsUndefs(S))
-        continue;
-
-      SalvageableDVISCEVs.push_back(
-          {DVI, DVI->getExpression(), DVI->getRawLocation(),
-           SE.getSCEV(DVI->getVariableLocationOp(0))});
+      std::unique_ptr<DVIRecoveryRec> NewRec =
+          std::make_unique<DVIRecoveryRec>(DVI);
+      // Each location Op may need a SCEVDbgValueBuilder in order to recover it.
+      // Pre-allocating a vector will enable quick lookups of the builder later
+      // during the salvage.
+      NewRec->RecoveryExprs.resize(DVI->getNumVariableLocationOps());
+      for (const auto LocOp : DVI->location_ops()) {
+        NewRec->SCEVs.push_back(SE.getSCEV(LocOp));
+        NewRec->LocationOps.push_back(LocOp);
+        NewRec->HadLocationArgList = DVI->hasArgList();
+      }
+      SalvageableDVISCEVs.push_back(std::move(NewRec));
       DVIHandles.insert(DVI);
     }
   }
@@ -6345,9 +6741,9 @@ static bool ReduceLoopStrength(Loop *L, IVUsers &IU, ScalarEvolution &SE,
 
   // Debug preservation - before we start removing anything identify which DVI
   // meet the salvageable criteria and store their DIExpression and SCEVs.
-  SmallVector<DVIRecoveryRec, 2> SalvageableDVI;
+  SmallVector<std::unique_ptr<DVIRecoveryRec>, 2> SalvageableDVIRecords;
   SmallSet<AssertingVH<DbgValueInst>, 2> DVIHandles;
-  DbgGatherSalvagableDVI(L, SE, SalvageableDVI, DVIHandles);
+  DbgGatherSalvagableDVI(L, SE, SalvageableDVIRecords, DVIHandles);
 
   bool Changed = false;
   std::unique_ptr<MemorySSAUpdater> MSSAU;
@@ -6376,8 +6772,26 @@ static bool ReduceLoopStrength(Loop *L, IVUsers &IU, ScalarEvolution &SE,
       DeleteDeadPHIs(L->getHeader(), &TLI, MSSAU.get());
     }
   }
+  // LSR may at times remove all uses of an induction variable from a loop.
+  // The only remaining use is the PHI in the exit block.
+  // When this is the case, if the exit value of the IV can be calculated using
+  // SCEV, we can replace the exit block PHI with the final value of the IV and
+  // skip the updates in each loop iteration.
+  if (L->isRecursivelyLCSSAForm(DT, LI) && LoopExitValHasSingleUse(L)) {
+    SmallVector<WeakTrackingVH, 16> DeadInsts;
+    const DataLayout &DL = L->getHeader()->getModule()->getDataLayout();
+    SCEVExpander Rewriter(SE, DL, "lsr", false);
+    int Rewrites = rewriteLoopExitValues(L, &LI, &TLI, &SE, &TTI, Rewriter, &DT,
+                                         OnlyCheapRepl, DeadInsts);
+    if (Rewrites) {
+      Changed = true;
+      RecursivelyDeleteTriviallyDeadInstructionsPermissive(DeadInsts, &TLI,
+                                                           MSSAU.get());
+      DeleteDeadPHIs(L->getHeader(), &TLI, MSSAU.get());
+    }
+  }
 
-  if (SalvageableDVI.empty())
+  if (SalvageableDVIRecords.empty())
     return Changed;
 
   // Obtain relevant IVs and attempt to rewrite the salvageable DVIs with
@@ -6385,13 +6799,16 @@ static bool ReduceLoopStrength(Loop *L, IVUsers &IU, ScalarEvolution &SE,
   // TODO: Allow for multiple IV references for nested AddRecSCEVs
   for (auto &L : LI) {
     if (llvm::PHINode *IV = GetInductionVariable(*L, SE, Reducer))
-      DbgRewriteSalvageableDVIs(L, SE, IV, SalvageableDVI);
+      DbgRewriteSalvageableDVIs(L, SE, IV, SalvageableDVIRecords);
     else {
       LLVM_DEBUG(dbgs() << "scev-salvage: SCEV salvaging not possible. An IV "
                            "could not be identified.\n");
     }
   }
 
+  for (auto &Rec : SalvageableDVIRecords)
+    Rec->clear();
+  SalvageableDVIRecords.clear();
   DVIHandles.clear();
   return Changed;
 }

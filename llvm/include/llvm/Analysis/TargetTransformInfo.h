@@ -21,8 +21,8 @@
 #ifndef LLVM_ANALYSIS_TARGETTRANSFORMINFO_H
 #define LLVM_ANALYSIS_TARGETTRANSFORMINFO_H
 
+#include "llvm/IR/FMF.h"
 #include "llvm/IR/InstrTypes.h"
-#include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/AtomicOrdering.h"
@@ -615,9 +615,20 @@ public:
                              unsigned AddrSpace = 0,
                              Instruction *I = nullptr) const;
 
+  /// Return true if the addressing mode represented by AM is legal for
+  /// this target, for a load/store of the specified type.
+  /// The type may be VoidTy, in which case only return true if the addressing
+  /// mode is legal for a load/store of any legal type.
+  /// If target returns true in LSRWithInstrQueries(), I may be valid.
+  /// TODO: Handle pre/postinc as well.
+  bool isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV, int64_t BaseOffset,
+                             bool HasBaseReg, Type *BaseType, int64_t Scale,
+                             Type *ScaleType, unsigned AddrSpace = 0,
+                             Instruction *I = nullptr) const;
+
   /// Return true if LSR cost of C1 is lower than C1.
-  bool isLSRCostLess(TargetTransformInfo::LSRCost &C1,
-                     TargetTransformInfo::LSRCost &C2) const;
+  bool isLSRCostLess(const TargetTransformInfo::LSRCost &C1,
+                     const TargetTransformInfo::LSRCost &C2) const;
 
   /// Return true if LSR major cost is number of registers. Targets which
   /// implement their own isLSRCostLess and unset number of registers as major
@@ -657,6 +668,10 @@ public:
   bool isLegalNTStore(Type *DataType, Align Alignment) const;
   /// Return true if the target supports nontemporal load.
   bool isLegalNTLoad(Type *DataType, Align Alignment) const;
+
+  /// \Returns true if the target supports broadcasting a load to a vector of
+  /// type <NumElements x ElementTy>.
+  bool isLegalBroadcastLoad(Type *ElementTy, ElementCount NumElements) const;
 
   /// Return true if the target supports masked scatter.
   bool isLegalMaskedScatter(Type *DataType, Align Alignment) const;
@@ -705,6 +720,18 @@ public:
                                        int64_t Scale,
                                        unsigned AddrSpace = 0) const;
 
+  /// Return the cost of the scaling factor used in the addressing
+  /// mode represented by AM for this target, for a load/store
+  /// of the specified type.
+  /// If the AM is supported, the return value must be >= 0.
+  /// If the AM is not supported, it returns a negative value.
+  /// TODO: Handle pre/postinc as well.
+  InstructionCost getScalingFactorCost(Type *Ty, GlobalValue *BaseGV,
+                                       int64_t BaseOffset, bool HasBaseReg,
+                                       Type *BaseType, int64_t Scale,
+                                       Type *ScaleType,
+                                       unsigned AddrSpace = 0) const;
+
   /// Return true if the loop strength reduce pass should make
   /// Instruction* based TTI queries to isLegalAddressingMode(). This is
   /// needed on SystemZ, where e.g. a memcpy can only have a 12 bit unsigned
@@ -716,6 +743,10 @@ public:
   /// by referencing its sub-register AX.
   bool isTruncateFree(Type *Ty1, Type *Ty2) const;
 
+  /// Return true if it's free to zero extend a value of type Ty1 to type
+  /// Ty2.
+  bool isZExtFree(Type *Ty1, Type *Ty2) const;
+
   /// Return true if it is profitable to hoist instruction in the
   /// then/else to before if.
   bool isProfitableToHoist(Instruction *I) const;
@@ -726,7 +757,7 @@ public:
   bool isTypeLegal(Type *Ty) const;
 
   /// Returns the estimated number of registers required to represent \p Ty.
-  InstructionCost getRegUsageForType(Type *Ty) const;
+  unsigned getRegUsageForType(Type *Ty) const;
 
   /// Return true if switches should be turned into lookup tables for the
   /// target.
@@ -933,7 +964,8 @@ public:
   /// creating vectors that span multiple vector registers.
   /// If false, the vectorization factor will be chosen based on the
   /// size of the widest element type.
-  bool shouldMaximizeVectorBandwidth() const;
+  /// \p K Register Kind for vectorization.
+  bool shouldMaximizeVectorBandwidth(TargetTransformInfo::RegisterKind K) const;
 
   /// \return The minimum vectorization factor for types of given element
   /// bit width, or 0 if there is no minimum VF. The returned value only
@@ -945,6 +977,17 @@ public:
   /// bit width and opcode, or 0 if there is no maximum VF.
   /// Currently only used by the SLP vectorizer.
   unsigned getMaximumVF(unsigned ElemWidth, unsigned Opcode) const;
+
+  /// \return The minimum vectorization factor for the store instruction. Given
+  /// the initial estimation of the minimum vector factor and store value type,
+  /// it tries to find possible lowest VF, which still might be profitable for
+  /// the vectorization.
+  /// \param VF Initial estimation of the minimum vector factor.
+  /// \param ScalarMemTy Scalar memory type of the store operation.
+  /// \param ScalarValTy Scalar type of the stored value.
+  /// Currently only used by the SLP vectorizer.
+  unsigned getStoreMinimumVF(unsigned VF, Type *ScalarMemTy,
+                             Type *ScalarValTy) const;
 
   /// \return True if it should be considered for address type promotion.
   /// \p AllowPromotionWithoutCommonHeader Set true if promoting \p I is
@@ -1044,11 +1087,14 @@ public:
   /// The exact mask may be passed as Mask, or else the array will be empty.
   /// The index and subtype parameters are used by the subvector insertion and
   /// extraction shuffle kinds to show the insert/extract point and the type of
-  /// the subvector being inserted/extracted.
+  /// the subvector being inserted/extracted. The operands of the shuffle can be
+  /// passed through \p Args, which helps improve the cost estimation in some
+  /// cases, like in broadcast loads.
   /// NOTE: For subvector extractions Tp represents the source type.
   InstructionCost getShuffleCost(ShuffleKind Kind, VectorType *Tp,
                                  ArrayRef<int> Mask = None, int Index = 0,
-                                 VectorType *SubTp = nullptr) const;
+                                 VectorType *SubTp = nullptr,
+                                 ArrayRef<const Value *> Args = None) const;
 
   /// Represents a hint about the context in which a cast is used.
   ///
@@ -1282,9 +1328,11 @@ public:
                                            Type *ExpectedType) const;
 
   /// \returns The type to use in a loop expansion of a memcpy call.
-  Type *getMemcpyLoopLoweringType(LLVMContext &Context, Value *Length,
-                                  unsigned SrcAddrSpace, unsigned DestAddrSpace,
-                                  unsigned SrcAlign, unsigned DestAlign) const;
+  Type *
+  getMemcpyLoopLoweringType(LLVMContext &Context, Value *Length,
+                            unsigned SrcAddrSpace, unsigned DestAddrSpace,
+                            unsigned SrcAlign, unsigned DestAlign,
+                            Optional<uint32_t> AtomicElementSize = None) const;
 
   /// \param[out] OpsOut The operand types to copy RemainingBytes of memory.
   /// \param RemainingBytes The number of bytes to copy.
@@ -1295,7 +1343,8 @@ public:
   void getMemcpyLoopResidualLoweringType(
       SmallVectorImpl<Type *> &OpsOut, LLVMContext &Context,
       unsigned RemainingBytes, unsigned SrcAddrSpace, unsigned DestAddrSpace,
-      unsigned SrcAlign, unsigned DestAlign) const;
+      unsigned SrcAlign, unsigned DestAlign,
+      Optional<uint32_t> AtomicCpySize = None) const;
 
   /// \returns True if the two functions have compatible attributes for inlining
   /// purposes.
@@ -1446,6 +1495,8 @@ public:
   VPLegalization getVPLegalizationStrategy(const VPIntrinsic &PI) const;
   /// @}
 
+  bool allowIllegalIntegerIV() const;
+
   /// @}
 
 private:
@@ -1535,8 +1586,13 @@ public:
                                      int64_t BaseOffset, bool HasBaseReg,
                                      int64_t Scale, unsigned AddrSpace,
                                      Instruction *I) = 0;
-  virtual bool isLSRCostLess(TargetTransformInfo::LSRCost &C1,
-                             TargetTransformInfo::LSRCost &C2) = 0;
+  virtual bool isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV,
+                                     int64_t BaseOffset, bool HasBaseReg,
+                                     Type *BaseType, int64_t Scale,
+                                     Type *ScaleType, unsigned AddrSpace,
+                                     Instruction *I) = 0;
+  virtual bool isLSRCostLess(const TargetTransformInfo::LSRCost &C1,
+                             const TargetTransformInfo::LSRCost &C2) = 0;
   virtual bool isNumRegsMajorCostOfLSR() = 0;
   virtual bool isProfitableLSRChainElement(Instruction *I) = 0;
   virtual bool canMacroFuseCmp() = 0;
@@ -1549,6 +1605,8 @@ public:
   virtual bool isLegalMaskedLoad(Type *DataType, Align Alignment) = 0;
   virtual bool isLegalNTStore(Type *DataType, Align Alignment) = 0;
   virtual bool isLegalNTLoad(Type *DataType, Align Alignment) = 0;
+  virtual bool isLegalBroadcastLoad(Type *ElementTy,
+                                    ElementCount NumElements) const = 0;
   virtual bool isLegalMaskedScatter(Type *DataType, Align Alignment) = 0;
   virtual bool isLegalMaskedGather(Type *DataType, Align Alignment) = 0;
   virtual bool forceScalarizeMaskedGather(VectorType *DataType,
@@ -1565,12 +1623,18 @@ public:
                                                int64_t BaseOffset,
                                                bool HasBaseReg, int64_t Scale,
                                                unsigned AddrSpace) = 0;
+  virtual InstructionCost getScalingFactorCost(Type *Ty, GlobalValue *BaseGV,
+                                               int64_t BaseOffset,
+                                               bool HasBaseReg, Type *BaseType,
+                                               int64_t Scale, Type *ScaleType,
+                                               unsigned AddrSpace) = 0;
   virtual bool LSRWithInstrQueries() = 0;
   virtual bool isTruncateFree(Type *Ty1, Type *Ty2) = 0;
+  virtual bool isZExtFree(Type *Ty1, Type *Ty2) = 0;
   virtual bool isProfitableToHoist(Instruction *I) = 0;
   virtual bool useAA() = 0;
   virtual bool isTypeLegal(Type *Ty) = 0;
-  virtual InstructionCost getRegUsageForType(Type *Ty) = 0;
+  virtual unsigned getRegUsageForType(Type *Ty) = 0;
   virtual bool shouldBuildLookupTables() = 0;
   virtual bool shouldBuildLookupTablesForConstant(Constant *C) = 0;
   virtual bool shouldBuildRelLookupTables() = 0;
@@ -1617,10 +1681,13 @@ public:
   virtual unsigned getMinVectorRegisterBitWidth() const = 0;
   virtual Optional<unsigned> getMaxVScale() const = 0;
   virtual Optional<unsigned> getVScaleForTuning() const = 0;
-  virtual bool shouldMaximizeVectorBandwidth() const = 0;
+  virtual bool
+  shouldMaximizeVectorBandwidth(TargetTransformInfo::RegisterKind K) const = 0;
   virtual ElementCount getMinimumVF(unsigned ElemWidth,
                                     bool IsScalable) const = 0;
   virtual unsigned getMaximumVF(unsigned ElemWidth, unsigned Opcode) const = 0;
+  virtual unsigned getStoreMinimumVF(unsigned VF, Type *ScalarMemTy,
+                                     Type *ScalarValTy) const = 0;
   virtual bool shouldConsiderAddressTypePromotion(
       const Instruction &I, bool &AllowPromotionWithoutCommonHeader) = 0;
   virtual unsigned getCacheLineSize() const = 0;
@@ -1659,7 +1726,8 @@ public:
       ArrayRef<const Value *> Args, const Instruction *CxtI = nullptr) = 0;
   virtual InstructionCost getShuffleCost(ShuffleKind Kind, VectorType *Tp,
                                          ArrayRef<int> Mask, int Index,
-                                         VectorType *SubTp) = 0;
+                                         VectorType *SubTp,
+                                         ArrayRef<const Value *> Args) = 0;
   virtual InstructionCost getCastInstrCost(unsigned Opcode, Type *Dst,
                                            Type *Src, CastContextHint CCH,
                                            TTI::TargetCostKind CostKind,
@@ -1733,15 +1801,17 @@ public:
   virtual unsigned getAtomicMemIntrinsicMaxElementSize() const = 0;
   virtual Value *getOrCreateResultFromMemIntrinsic(IntrinsicInst *Inst,
                                                    Type *ExpectedType) = 0;
-  virtual Type *getMemcpyLoopLoweringType(LLVMContext &Context, Value *Length,
-                                          unsigned SrcAddrSpace,
-                                          unsigned DestAddrSpace,
-                                          unsigned SrcAlign,
-                                          unsigned DestAlign) const = 0;
+  virtual Type *
+  getMemcpyLoopLoweringType(LLVMContext &Context, Value *Length,
+                            unsigned SrcAddrSpace, unsigned DestAddrSpace,
+                            unsigned SrcAlign, unsigned DestAlign,
+                            Optional<uint32_t> AtomicElementSize) const = 0;
+
   virtual void getMemcpyLoopResidualLoweringType(
       SmallVectorImpl<Type *> &OpsOut, LLVMContext &Context,
       unsigned RemainingBytes, unsigned SrcAddrSpace, unsigned DestAddrSpace,
-      unsigned SrcAlign, unsigned DestAlign) const = 0;
+      unsigned SrcAlign, unsigned DestAlign,
+      Optional<uint32_t> AtomicCpySize) const = 0;
   virtual bool areInlineCompatible(const Function *Caller,
                                    const Function *Callee) const = 0;
   virtual bool areTypesABICompatible(const Function *Caller,
@@ -1780,6 +1850,7 @@ public:
   virtual InstructionCost getInstructionLatency(const Instruction *I) = 0;
   virtual VPLegalization
   getVPLegalizationStrategy(const VPIntrinsic &PI) const = 0;
+  virtual bool allowIllegalIntegerIV() const = 0;
 };
 
 template <typename T>
@@ -1919,8 +1990,15 @@ public:
     return Impl.isLegalAddressingMode(Ty, BaseGV, BaseOffset, HasBaseReg, Scale,
                                       AddrSpace, I);
   }
-  bool isLSRCostLess(TargetTransformInfo::LSRCost &C1,
-                     TargetTransformInfo::LSRCost &C2) override {
+  bool isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV, int64_t BaseOffset,
+                             bool HasBaseReg, Type *BaseType, int64_t Scale,
+                             Type *ScaleType, unsigned AddrSpace,
+                             Instruction *I) override {
+    return Impl.isLegalAddressingMode(Ty, BaseGV, BaseOffset, HasBaseReg,
+                                      BaseType, Scale, ScaleType, AddrSpace, I);
+  }
+  bool isLSRCostLess(const TargetTransformInfo::LSRCost &C1,
+                     const TargetTransformInfo::LSRCost &C2) override {
     return Impl.isLSRCostLess(C1, C2);
   }
   bool isNumRegsMajorCostOfLSR() override {
@@ -1951,6 +2029,10 @@ public:
   }
   bool isLegalNTLoad(Type *DataType, Align Alignment) override {
     return Impl.isLegalNTLoad(DataType, Alignment);
+  }
+  bool isLegalBroadcastLoad(Type *ElementTy,
+                            ElementCount NumElements) const override {
+    return Impl.isLegalBroadcastLoad(ElementTy, NumElements);
   }
   bool isLegalMaskedScatter(Type *DataType, Align Alignment) override {
     return Impl.isLegalMaskedScatter(DataType, Alignment);
@@ -1991,16 +2073,27 @@ public:
     return Impl.getScalingFactorCost(Ty, BaseGV, BaseOffset, HasBaseReg, Scale,
                                      AddrSpace);
   }
+  InstructionCost getScalingFactorCost(Type *Ty, GlobalValue *BaseGV,
+                                       int64_t BaseOffset, bool HasBaseReg,
+                                       Type *BaseType, int64_t Scale,
+                                       Type *ScaleType,
+                                       unsigned AddrSpace) override {
+    return Impl.getScalingFactorCost(Ty, BaseGV, BaseOffset, HasBaseReg,
+                                     BaseType, Scale, ScaleType, AddrSpace);
+  }
   bool LSRWithInstrQueries() override { return Impl.LSRWithInstrQueries(); }
   bool isTruncateFree(Type *Ty1, Type *Ty2) override {
     return Impl.isTruncateFree(Ty1, Ty2);
+  }
+  bool isZExtFree(Type *Ty1, Type *Ty2) override {
+    return Impl.isZExtFree(Ty1, Ty2);
   }
   bool isProfitableToHoist(Instruction *I) override {
     return Impl.isProfitableToHoist(I);
   }
   bool useAA() override { return Impl.useAA(); }
   bool isTypeLegal(Type *Ty) override { return Impl.isTypeLegal(Ty); }
-  InstructionCost getRegUsageForType(Type *Ty) override {
+  unsigned getRegUsageForType(Type *Ty) override {
     return Impl.getRegUsageForType(Ty);
   }
   bool shouldBuildLookupTables() override {
@@ -2107,8 +2200,9 @@ public:
   Optional<unsigned> getVScaleForTuning() const override {
     return Impl.getVScaleForTuning();
   }
-  bool shouldMaximizeVectorBandwidth() const override {
-    return Impl.shouldMaximizeVectorBandwidth();
+  bool shouldMaximizeVectorBandwidth(
+      TargetTransformInfo::RegisterKind K) const override {
+    return Impl.shouldMaximizeVectorBandwidth(K);
   }
   ElementCount getMinimumVF(unsigned ElemWidth,
                             bool IsScalable) const override {
@@ -2116,6 +2210,10 @@ public:
   }
   unsigned getMaximumVF(unsigned ElemWidth, unsigned Opcode) const override {
     return Impl.getMaximumVF(ElemWidth, Opcode);
+  }
+  unsigned getStoreMinimumVF(unsigned VF, Type *ScalarMemTy,
+                             Type *ScalarValTy) const override {
+    return Impl.getStoreMinimumVF(VF, ScalarMemTy, ScalarValTy);
   }
   bool shouldConsiderAddressTypePromotion(
       const Instruction &I, bool &AllowPromotionWithoutCommonHeader) override {
@@ -2179,8 +2277,9 @@ public:
   }
   InstructionCost getShuffleCost(ShuffleKind Kind, VectorType *Tp,
                                  ArrayRef<int> Mask, int Index,
-                                 VectorType *SubTp) override {
-    return Impl.getShuffleCost(Kind, Tp, Mask, Index, SubTp);
+                                 VectorType *SubTp,
+                                 ArrayRef<const Value *> Args) override {
+    return Impl.getShuffleCost(Kind, Tp, Mask, Index, SubTp, Args);
   }
   InstructionCost getCastInstrCost(unsigned Opcode, Type *Dst, Type *Src,
                                    CastContextHint CCH,
@@ -2297,20 +2396,22 @@ public:
                                            Type *ExpectedType) override {
     return Impl.getOrCreateResultFromMemIntrinsic(Inst, ExpectedType);
   }
-  Type *getMemcpyLoopLoweringType(LLVMContext &Context, Value *Length,
-                                  unsigned SrcAddrSpace, unsigned DestAddrSpace,
-                                  unsigned SrcAlign,
-                                  unsigned DestAlign) const override {
+  Type *getMemcpyLoopLoweringType(
+      LLVMContext &Context, Value *Length, unsigned SrcAddrSpace,
+      unsigned DestAddrSpace, unsigned SrcAlign, unsigned DestAlign,
+      Optional<uint32_t> AtomicElementSize) const override {
     return Impl.getMemcpyLoopLoweringType(Context, Length, SrcAddrSpace,
-                                          DestAddrSpace, SrcAlign, DestAlign);
+                                          DestAddrSpace, SrcAlign, DestAlign,
+                                          AtomicElementSize);
   }
   void getMemcpyLoopResidualLoweringType(
       SmallVectorImpl<Type *> &OpsOut, LLVMContext &Context,
       unsigned RemainingBytes, unsigned SrcAddrSpace, unsigned DestAddrSpace,
-      unsigned SrcAlign, unsigned DestAlign) const override {
+      unsigned SrcAlign, unsigned DestAlign,
+      Optional<uint32_t> AtomicCpySize) const override {
     Impl.getMemcpyLoopResidualLoweringType(OpsOut, Context, RemainingBytes,
                                            SrcAddrSpace, DestAddrSpace,
-                                           SrcAlign, DestAlign);
+                                           SrcAlign, DestAlign, AtomicCpySize);
   }
   bool areInlineCompatible(const Function *Caller,
                            const Function *Callee) const override {
@@ -2398,6 +2499,9 @@ public:
   VPLegalization
   getVPLegalizationStrategy(const VPIntrinsic &PI) const override {
     return Impl.getVPLegalizationStrategy(PI);
+  }
+  bool allowIllegalIntegerIV() const override {
+    return Impl.allowIllegalIntegerIV();
   }
 };
 

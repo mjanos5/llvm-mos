@@ -593,8 +593,9 @@ define <4 x i64> @insert_v4i64(<4 x i64> %x, i64 %y , i64* %ptr) {
 define <2 x i64> @insert_v2i64(<2 x i64> %x, i64 %y , i64* %ptr) {
 ; CHECK-LABEL: insert_v2i64:
 ; CHECK:       ## %bb.0:
-; CHECK-NEXT:    vpinsrq $0, %rdi, %xmm0, %xmm0
-; CHECK-NEXT:    vpinsrq $1, (%rsi), %xmm0, %xmm0
+; CHECK-NEXT:    vmovq {{.*#+}} xmm0 = mem[0],zero
+; CHECK-NEXT:    vmovq %rdi, %xmm1
+; CHECK-NEXT:    vpunpcklqdq {{.*#+}} xmm0 = xmm1[0],xmm0[0]
 ; CHECK-NEXT:    retq
   %val = load i64, i64* %ptr
   %r1 = insertelement <2 x i64> %x, i64 %val, i32 1
@@ -668,7 +669,6 @@ define <32 x i16> @insert_v32i16(<32 x i16> %x, i16 %y, i16* %ptr) {
 ; KNL-NEXT:    vinserti32x4 $0, %xmm1, %zmm0, %zmm1
 ; KNL-NEXT:    vmovd %edi, %xmm0
 ; KNL-NEXT:    vpbroadcastw %xmm0, %ymm0
-; KNL-NEXT:    vinserti64x4 $1, %ymm0, %zmm0, %zmm0
 ; KNL-NEXT:    vpternlogq $216, {{\.?LCPI[0-9]+_[0-9]+}}(%rip), %zmm1, %zmm0
 ; KNL-NEXT:    retq
 ;
@@ -1634,23 +1634,12 @@ define zeroext i8 @test_extractelement_varible_v16i1(<16 x i32> %a, <16 x i32> %
 define zeroext i8 @test_extractelement_varible_v32i1(<32 x i8> %a, <32 x i8> %b, i32 %index) {
 ; KNL-LABEL: test_extractelement_varible_v32i1:
 ; KNL:       ## %bb.0:
-; KNL-NEXT:    pushq %rbp
-; KNL-NEXT:    .cfi_def_cfa_offset 16
-; KNL-NEXT:    .cfi_offset %rbp, -16
-; KNL-NEXT:    movq %rsp, %rbp
-; KNL-NEXT:    .cfi_def_cfa_register %rbp
-; KNL-NEXT:    andq $-32, %rsp
-; KNL-NEXT:    subq $64, %rsp
-; KNL-NEXT:    ## kill: def $edi killed $edi def $rdi
 ; KNL-NEXT:    vpminub %ymm1, %ymm0, %ymm1
 ; KNL-NEXT:    vpcmpeqb %ymm1, %ymm0, %ymm0
-; KNL-NEXT:    vpternlogq $15, %zmm0, %zmm0, %zmm0
-; KNL-NEXT:    vmovdqa %ymm0, (%rsp)
-; KNL-NEXT:    andl $31, %edi
-; KNL-NEXT:    movzbl (%rsp,%rdi), %eax
-; KNL-NEXT:    andl $1, %eax
-; KNL-NEXT:    movq %rbp, %rsp
-; KNL-NEXT:    popq %rbp
+; KNL-NEXT:    vpmovmskb %ymm0, %ecx
+; KNL-NEXT:    xorl %eax, %eax
+; KNL-NEXT:    btl %edi, %ecx
+; KNL-NEXT:    setae %al
 ; KNL-NEXT:    vzeroupper
 ; KNL-NEXT:    retq
 ;
@@ -2265,22 +2254,19 @@ define void @test_concat_v2i1(<2 x half>* %arg, <2 x half>* %arg1, <2 x half>* %
 ; KNL-NEXT:    korw %k2, %k1, %k1
 ; KNL-NEXT:    kandw %k1, %k0, %k0
 ; KNL-NEXT:    kshiftrw $1, %k0, %k1
-; KNL-NEXT:    kmovw %k1, %ecx
-; KNL-NEXT:    xorl %eax, %eax
-; KNL-NEXT:    testb $1, %cl
-; KNL-NEXT:    movl $0, %ecx
-; KNL-NEXT:    je LBB85_2
-; KNL-NEXT:  ## %bb.1:
-; KNL-NEXT:    movzwl 2(%rsi), %ecx
-; KNL-NEXT:  LBB85_2:
+; KNL-NEXT:    kmovw %k1, %edi
+; KNL-NEXT:    movzwl 2(%rsi), %eax
+; KNL-NEXT:    xorl %ecx, %ecx
+; KNL-NEXT:    testb $1, %dil
+; KNL-NEXT:    cmovel %ecx, %eax
 ; KNL-NEXT:    kmovw %k0, %edi
 ; KNL-NEXT:    testb $1, %dil
-; KNL-NEXT:    je LBB85_4
-; KNL-NEXT:  ## %bb.3:
-; KNL-NEXT:    movzwl (%rsi), %eax
-; KNL-NEXT:  LBB85_4:
-; KNL-NEXT:    movw %ax, (%rdx)
-; KNL-NEXT:    movw %cx, 2(%rdx)
+; KNL-NEXT:    je LBB85_2
+; KNL-NEXT:  ## %bb.1:
+; KNL-NEXT:    movl (%rsi), %ecx
+; KNL-NEXT:  LBB85_2:
+; KNL-NEXT:    movw %cx, (%rdx)
+; KNL-NEXT:    movw %ax, 2(%rdx)
 ; KNL-NEXT:    retq
 ;
 ; SKX-LABEL: test_concat_v2i1:
@@ -2315,22 +2301,19 @@ define void @test_concat_v2i1(<2 x half>* %arg, <2 x half>* %arg1, <2 x half>* %
 ; SKX-NEXT:    korw %k1, %k2, %k1
 ; SKX-NEXT:    kandw %k1, %k0, %k0
 ; SKX-NEXT:    kshiftrb $1, %k0, %k1
-; SKX-NEXT:    kmovd %k1, %ecx
-; SKX-NEXT:    xorl %eax, %eax
-; SKX-NEXT:    testb $1, %cl
-; SKX-NEXT:    movl $0, %ecx
-; SKX-NEXT:    je LBB85_2
-; SKX-NEXT:  ## %bb.1:
-; SKX-NEXT:    movzwl 2(%rsi), %ecx
-; SKX-NEXT:  LBB85_2:
+; SKX-NEXT:    kmovd %k1, %edi
+; SKX-NEXT:    movzwl 2(%rsi), %eax
+; SKX-NEXT:    xorl %ecx, %ecx
+; SKX-NEXT:    testb $1, %dil
+; SKX-NEXT:    cmovel %ecx, %eax
 ; SKX-NEXT:    kmovd %k0, %edi
 ; SKX-NEXT:    testb $1, %dil
-; SKX-NEXT:    je LBB85_4
-; SKX-NEXT:  ## %bb.3:
-; SKX-NEXT:    movzwl (%rsi), %eax
-; SKX-NEXT:  LBB85_4:
-; SKX-NEXT:    movw %ax, (%rdx)
-; SKX-NEXT:    movw %cx, 2(%rdx)
+; SKX-NEXT:    je LBB85_2
+; SKX-NEXT:  ## %bb.1:
+; SKX-NEXT:    movl (%rsi), %ecx
+; SKX-NEXT:  LBB85_2:
+; SKX-NEXT:    movw %cx, (%rdx)
+; SKX-NEXT:    movw %ax, 2(%rdx)
 ; SKX-NEXT:    retq
   %tmp = load <2 x half>, <2 x half>* %arg, align 8
   %tmp3 = fcmp fast olt <2 x half> %tmp, <half 0xH4600, half 0xH4600>

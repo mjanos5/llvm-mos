@@ -29,7 +29,6 @@
 #include "llvm/Support/Printable.h"
 #include <cassert>
 #include <cstdint>
-#include <functional>
 
 namespace llvm {
 
@@ -56,6 +55,8 @@ public:
   const LaneBitmask LaneMask;
   /// Classes with a higher priority value are assigned first by register
   /// allocators using a greedy heuristic. The value is in the range [0,63].
+  /// Values >= 32 should be used with care since they may overlap with other
+  /// fields in the allocator's priority heuristics.
   const uint8_t AllocationPriority;
   /// Configurable target specific flags.
   const uint8_t TSFlags;
@@ -415,19 +416,11 @@ public:
 
   /// Returns true if the two registers are equal or alias each other.
   /// The registers may be virtual registers.
-  bool regsOverlap(Register regA, Register regB) const {
-    if (regA == regB) return true;
-    if (!regA.isPhysical() || !regB.isPhysical())
-      return false;
-
-    // Regunits are numerically ordered. Find a common unit.
-    MCRegUnitIterator RUA(regA.asMCReg(), this);
-    MCRegUnitIterator RUB(regB.asMCReg(), this);
-    do {
-      if (*RUA == *RUB) return true;
-      if (*RUA < *RUB) ++RUA;
-      else             ++RUB;
-    } while (RUA.isValid() && RUB.isValid());
+  bool regsOverlap(Register RegA, Register RegB) const {
+    if (RegA == RegB)
+      return true;
+    if (RegA.isPhysical() && RegB.isPhysical())
+      return MCRegisterInfo::regsOverlap(RegA.asMCReg(), RegB.asMCReg());
     return false;
   }
 
@@ -894,7 +887,9 @@ public:
   /// Allow the target to override the cost of using a callee-saved register for
   /// the first time. Default value of 0 means we will use a callee-saved
   /// register if it is available.
-  virtual unsigned getCSRFirstUseCost() const { return 0; }
+  virtual unsigned getCSRFirstUseCost(const MachineFunction &MF) const {
+    return 0;
+  }
 
   /// Returns true if the target requires (and can make use of) the register
   /// scavenger.
@@ -1014,6 +1009,12 @@ public:
     return false;
   }
 
+  /// Returns whether or not a target can support saveScavengerRegister for the
+  /// given Register.
+  virtual bool canSaveScavengerRegister(Register Reg) const {
+    return true;
+  }
+
   /// This method must be overriden to eliminate abstract frame indices from
   /// instructions which may use them. The instruction referenced by the
   /// iterator contains an MO_FrameIndex operand which must be eliminated by
@@ -1082,6 +1083,14 @@ public:
   virtual bool
   shouldUseDeferredSpillingForVirtReg(const MachineFunction &MF,
                                       const LiveInterval &VirtReg) const {
+    return false;
+  }
+
+  /// When prioritizing live ranges in register allocation, if this hook returns
+  /// true then the AllocationPriority of the register class will be treated as
+  /// more important than whether the range is local to a basic block or global.
+  virtual bool
+  regClassPriorityTrumpsGlobalness(const MachineFunction &MF) const {
     return false;
   }
 

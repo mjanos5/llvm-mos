@@ -18,12 +18,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Analysis/BlockFrequencyInfo.h"
-#include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
-#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
-#include "llvm/Support/CodeGenCoverage.h"
+#include "llvm/IR/Function.h"
 #include "llvm/Support/LowLevelTypeImpl.h"
 #include <bitset>
 #include <cstddef>
@@ -34,6 +31,10 @@
 
 namespace llvm {
 
+class BlockFrequencyInfo;
+class CodeGenCoverage;
+class MachineBasicBlock;
+class ProfileSummaryInfo;
 class APInt;
 class APFloat;
 class GISelKnownBits;
@@ -441,6 +442,7 @@ public:
   MachineFunction *MF = nullptr;
   ProfileSummaryInfo *PSI = nullptr;
   BlockFrequencyInfo *BFI = nullptr;
+  AAResults *AA = nullptr;
   // For some predicates, we need to track the current MBB.
   MachineBasicBlock *CurMBB = nullptr;
 
@@ -451,12 +453,13 @@ public:
   /// Setup per-MF selector state.
   virtual void setupMF(MachineFunction &mf, GISelKnownBits *KB,
                        CodeGenCoverage &covinfo, ProfileSummaryInfo *psi,
-                       BlockFrequencyInfo *bfi) {
+                       BlockFrequencyInfo *bfi, AAResults *aa) {
     CoverageInfo = &covinfo;
     KnownBits = KB;
     MF = &mf;
     PSI = psi;
     BFI = bfi;
+    AA = aa;
     CurMBB = nullptr;
     setupGeneratedPerFunctionState(mf);
   }

@@ -54,7 +54,7 @@ public:
   const uint32_t *getDarwinCallPreservedMask(const MachineFunction &MF,
                                              CallingConv::ID) const;
 
-  unsigned getCSRFirstUseCost() const override {
+  unsigned getCSRFirstUseCost(const MachineFunction &MF) const override {
     // The cost will be compared against BlockFrequency where entry has the
     // value of 1 << 14. A value of 5 will choose to spill or split really
     // cold path instead of using a callee-saved register.
@@ -119,6 +119,9 @@ public:
   bool requiresVirtualBaseRegisters(const MachineFunction &MF) const override;
   bool hasBasePointer(const MachineFunction &MF) const;
   unsigned getBaseRegister() const;
+
+  bool isArgumentRegister(const MachineFunction &MF,
+                          MCRegister Reg) const override;
 
   // Debug information queries.
   Register getFrameRegister(const MachineFunction &MF) const override;

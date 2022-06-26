@@ -12,25 +12,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/IVUsers.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
-#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
-#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Type.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include <algorithm>
 using namespace llvm;
 
 #define DEBUG_TYPE "iv-users"
@@ -134,10 +130,10 @@ static bool IVUseShouldUsePostIncValue(Instruction *User, Value *Operand,
   return true;
 }
 
-/// Inspect the specified instruction.  If it is a reducible SCEV, recursively
-/// add its users to the IVUsesByStride set and return true.  Otherwise, return
-/// false.
-bool IVUsers::AddUsersIfInteresting(Instruction *I) {
+/// AddUsersImpl - Inspect the specified instruction.  If it is a
+/// reducible SCEV, recursively add its users to the IVUsesByStride set and
+/// return true.  Otherwise, return false.
+bool IVUsers::AddUsersImpl(Instruction *I, bool AllowNonNative) {
   const DataLayout &DL = I->getModule()->getDataLayout();
 
   // Add this IV user to the Processed set before returning false to ensure that
@@ -145,7 +141,8 @@ bool IVUsers::AddUsersIfInteresting(Instruction *I) {
   if (!Processed.insert(I).second)
     return true;    // Instruction already handled.
 
-  if (!SE->isSCEVable(I->getType()))
+  Type *Ty = I->getType();
+  if (!SE->isSCEVable(Ty))
     return false;   // Void and FP expressions cannot be reduced.
 
   // IVUsers is used by LSR which assumes that all SCEV expressions are safe to
@@ -156,10 +153,15 @@ bool IVUsers::AddUsersIfInteresting(Instruction *I) {
 
   // LSR is not APInt clean, do not touch integers bigger than 64-bits.
   // Also avoid creating IVs of non-native types. For example, we don't want a
-  // 64-bit IV in 32-bit code just because the loop has one 64-bit cast.
-  uint64_t Width = SE->getTypeSizeInBits(I->getType());
-  if (Width > 64 || !DL.isLegalInteger(Width))
+  // 64-bit IV in 32-bit code just because the loop has one 64-bit cast. We
+  // do consider the address space 0 index type legal; otherwise there's likely
+  // no way for LSR to intelligently apply addressing modes.
+  uint64_t Width = SE->getTypeSizeInBits(Ty);
+  bool IsNative = DL.isLegalInteger(Width) || Width == DL.getIndexSizeInBits(0);
+  if (Width > 64 || (!AllowNonNative && !IsNative))
     return false;
+  if (IsNative)
+    AllowNonNative = false;
 
   // Don't attempt to promote ephemeral values to indvars. They will be removed
   // later anyway.
@@ -193,12 +195,12 @@ bool IVUsers::AddUsersIfInteresting(Instruction *I) {
     bool AddUserToIVUsers = false;
     if (LI->getLoopFor(User->getParent()) != L) {
       if (isa<PHINode>(User) || Processed.count(User) ||
-          !AddUsersIfInteresting(User)) {
+          !AddUsersImpl(User, AllowNonNative)) {
         LLVM_DEBUG(dbgs() << "FOUND USER in other loop: " << *User << '\n'
                           << "   OF SCEV: " << *ISE << '\n');
         AddUserToIVUsers = true;
       }
-    } else if (Processed.count(User) || !AddUsersIfInteresting(User)) {
+    } else if (Processed.count(User) || !AddUsersImpl(User, AllowNonNative)) {
       LLVM_DEBUG(dbgs() << "FOUND USER: " << *User << '\n'
                         << "   OF SCEV: " << *ISE << '\n');
       AddUserToIVUsers = true;
@@ -245,6 +247,10 @@ bool IVUsers::AddUsersIfInteresting(Instruction *I) {
     }
   }
   return true;
+}
+
+bool IVUsers::AddUsersIfInteresting(Instruction *I) {
+  return AddUsersImpl(I, /*AllowNonNative=*/true);
 }
 
 IVStrideUse &IVUsers::AddUser(Instruction *User, Value *Operand) {

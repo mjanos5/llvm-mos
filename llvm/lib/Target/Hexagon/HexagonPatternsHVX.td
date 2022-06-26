@@ -37,7 +37,7 @@ def SDTHexagonVINSERTW0: SDTypeProfile<1, 2,
 def HexagonVINSERTW0: SDNode<"HexagonISD::VINSERTW0", SDTHexagonVINSERTW0>;
 
 def HwLen2: SDNodeXForm<imm, [{
-  const auto &ST = static_cast<const HexagonSubtarget&>(CurDAG->getSubtarget());
+  const auto &ST = CurDAG->getSubtarget<HexagonSubtarget>();
   return CurDAG->getTargetConstant(ST.getVectorLength()/2, SDLoc(N), MVT::i32);
 }]>;
 
@@ -92,19 +92,19 @@ def IsVecOff : PatLeaf<(i32 imm), [{
 
 
 def alignedload: PatFrag<(ops node:$a), (load $a), [{
-  return isAlignedMemNode(dyn_cast<MemSDNode>(N));
+  return isAlignedMemNode(cast<MemSDNode>(N));
 }]>;
 
 def unalignedload: PatFrag<(ops node:$a), (load $a), [{
-  return !isAlignedMemNode(dyn_cast<MemSDNode>(N));
+  return !isAlignedMemNode(cast<MemSDNode>(N));
 }]>;
 
 def alignedstore: PatFrag<(ops node:$v, node:$a), (store $v, $a), [{
-  return isAlignedMemNode(dyn_cast<MemSDNode>(N));
+  return isAlignedMemNode(cast<MemSDNode>(N));
 }]>;
 
 def unalignedstore: PatFrag<(ops node:$v, node:$a), (store $v, $a), [{
-  return !isAlignedMemNode(dyn_cast<MemSDNode>(N));
+  return !isAlignedMemNode(cast<MemSDNode>(N));
 }]>;
 
 

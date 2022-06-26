@@ -62,6 +62,30 @@ AttrOrTypeDef::AttrOrTypeDef(const llvm::Record *def) : def(def) {
     for (unsigned i = 0, e = parametersDag->getNumArgs(); i < e; ++i)
       parameters.push_back(AttrOrTypeParameter(parametersDag, i));
   }
+
+  // Verify the use of the mnemonic field.
+  bool hasCppFormat = hasCustomAssemblyFormat();
+  bool hasDeclarativeFormat = getAssemblyFormat().hasValue();
+  if (getMnemonic()) {
+    if (hasCppFormat && hasDeclarativeFormat) {
+      PrintFatalError(getLoc(), "cannot specify both 'assemblyFormat' "
+                                "and 'hasCustomAssemblyFormat'");
+    }
+    if (!parameters.empty() && !hasCppFormat && !hasDeclarativeFormat) {
+      PrintFatalError(getLoc(),
+                      "must specify either 'assemblyFormat' or "
+                      "'hasCustomAssemblyFormat' when 'mnemonic' is set");
+    }
+  } else if (hasCppFormat || hasDeclarativeFormat) {
+    PrintFatalError(getLoc(),
+                    "'assemblyFormat' or 'hasCustomAssemblyFormat' can only be "
+                    "used when 'mnemonic' is set");
+  }
+  // Assembly format requires accessors to be generated.
+  if (hasDeclarativeFormat && !genAccessors()) {
+    PrintFatalError(getLoc(),
+                    "'assemblyFormat' requires 'genAccessors' to be true");
+  }
 }
 
 Dialect AttrOrTypeDef::getDialect() const {
@@ -122,12 +146,8 @@ Optional<StringRef> AttrOrTypeDef::getMnemonic() const {
   return def->getValueAsOptionalString("mnemonic");
 }
 
-Optional<StringRef> AttrOrTypeDef::getPrinterCode() const {
-  return def->getValueAsOptionalString("printer");
-}
-
-Optional<StringRef> AttrOrTypeDef::getParserCode() const {
-  return def->getValueAsOptionalString("parser");
+bool AttrOrTypeDef::hasCustomAssemblyFormat() const {
+  return def->getValueAsBit("hasCustomAssemblyFormat");
 }
 
 Optional<StringRef> AttrOrTypeDef::getAssemblyFormat() const {
@@ -187,16 +207,25 @@ auto AttrOrTypeParameter::getDefValue(StringRef name) const {
   return result;
 }
 
+bool AttrOrTypeParameter::isAnonymous() const {
+  return !def->getArgName(index);
+}
+
 StringRef AttrOrTypeParameter::getName() const {
   return def->getArgName(index)->getValue();
+}
+
+std::string AttrOrTypeParameter::getAccessorName() const {
+  return "get" +
+         llvm::convertToCamelFromSnakeCase(getName(), /*capitalizeFirst=*/true);
 }
 
 Optional<StringRef> AttrOrTypeParameter::getAllocator() const {
   return getDefValue<llvm::StringInit>("allocator");
 }
 
-Optional<StringRef> AttrOrTypeParameter::getComparator() const {
-  return getDefValue<llvm::StringInit>("comparator");
+StringRef AttrOrTypeParameter::getComparator() const {
+  return getDefValue<llvm::StringInit>("comparator").value_or("$_lhs == $_rhs");
 }
 
 StringRef AttrOrTypeParameter::getCppType() const {
@@ -212,12 +241,11 @@ StringRef AttrOrTypeParameter::getCppType() const {
 
 StringRef AttrOrTypeParameter::getCppAccessorType() const {
   return getDefValue<llvm::StringInit>("cppAccessorType")
-      .getValueOr(getCppType());
+      .value_or(getCppType());
 }
 
 StringRef AttrOrTypeParameter::getCppStorageType() const {
-  return getDefValue<llvm::StringInit>("cppStorageType")
-      .getValueOr(getCppType());
+  return getDefValue<llvm::StringInit>("cppStorageType").value_or(getCppType());
 }
 
 Optional<StringRef> AttrOrTypeParameter::getParser() const {
@@ -235,11 +263,17 @@ Optional<StringRef> AttrOrTypeParameter::getSummary() const {
 StringRef AttrOrTypeParameter::getSyntax() const {
   if (auto *stringType = dyn_cast<llvm::StringInit>(getDef()))
     return stringType->getValue();
-  return getDefValue<llvm::StringInit>("syntax").getValueOr(getCppType());
+  return getDefValue<llvm::StringInit>("syntax").value_or(getCppType());
 }
 
 bool AttrOrTypeParameter::isOptional() const {
-  return getDefValue<llvm::BitInit>("isOptional").getValueOr(false);
+  // Parameters with default values are automatically optional.
+  return getDefValue<llvm::BitInit>("isOptional").value_or(false) ||
+         getDefaultValue().hasValue();
+}
+
+Optional<StringRef> AttrOrTypeParameter::getDefaultValue() const {
+  return getDefValue<llvm::StringInit>("defaultValue");
 }
 
 llvm::Init *AttrOrTypeParameter::getDef() const { return def->getArg(index); }

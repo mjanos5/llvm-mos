@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -21,7 +22,6 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include <algorithm>
 #include <cassert>
 
 using namespace llvm;
@@ -32,7 +32,8 @@ using namespace llvm;
 
 CallGraph::CallGraph(Module &M)
     : M(M), ExternalCallingNode(getOrInsertFunction(nullptr)),
-      CallsExternalNode(std::make_unique<CallGraphNode>(this, nullptr)) {
+      CallsExternalNode(std::make_unique<CallGraphNode>(this, nullptr)),
+      NoCallbackNode(std::make_unique<CallGraphNode>(this, nullptr)) {
   // Add every interesting function to the call graph.
   for (Function &F : M)
     if (!isDbgInfoIntrinsic(F.getIntrinsicID()))
@@ -42,20 +43,25 @@ CallGraph::CallGraph(Module &M)
 CallGraph::CallGraph(CallGraph &&Arg)
     : M(Arg.M), FunctionMap(std::move(Arg.FunctionMap)),
       ExternalCallingNode(Arg.ExternalCallingNode),
-      CallsExternalNode(std::move(Arg.CallsExternalNode)) {
+      CallsExternalNode(std::move(Arg.CallsExternalNode)),
+      NoCallbackNode(std::move(Arg.NoCallbackNode)) {
   Arg.FunctionMap.clear();
   Arg.ExternalCallingNode = nullptr;
 
   // Update parent CG for all call graph's nodes.
   CallsExternalNode->CG = this;
+  NoCallbackNode->CG = this;
   for (auto &P : FunctionMap)
     P.second->CG = this;
 }
 
 CallGraph::~CallGraph() {
-  // CallsExternalNode is not in the function map, delete it explicitly.
+  // Null nodes besides ExternalCallingNode are not in the function map, so
+  // delete them explicitly.
   if (CallsExternalNode)
     CallsExternalNode->allReferencesDropped();
+  if (NoCallbackNode)
+    NoCallbackNode->allReferencesDropped();
 
 // Reset all node's use counts to zero before deleting them to prevent an
 // assertion from firing.
@@ -70,8 +76,7 @@ bool CallGraph::invalidate(Module &, const PreservedAnalyses &PA,
   // Check whether the analysis, all analyses on functions, or the function's
   // CFG have been preserved.
   auto PAC = PA.getChecker<CallGraphAnalysis>();
-  return !(PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Module>>() ||
-           PAC.preservedSet<CFGAnalyses>());
+  return !(PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Module>>());
 }
 
 void CallGraph::addToCallGraph(Function *F) {
@@ -92,8 +97,9 @@ void CallGraph::populateCallGraphNode(CallGraphNode *Node) {
   Function *F = Node->getFunction();
 
   // If this function is not defined in this translation unit, it could call
-  // anything.
-  if (F->isDeclaration() && !F->isIntrinsic())
+  // anything, unless it's also marked NoCallback.
+  if (F->isDeclaration() && !F->isIntrinsic() &&
+      !F->hasFnAttribute(Attribute::NoCallback))
     Node->addCalledFunction(nullptr, CallsExternalNode.get());
 
   // Look for calls by this function.
@@ -101,12 +107,16 @@ void CallGraph::populateCallGraphNode(CallGraphNode *Node) {
     for (Instruction &I : BB) {
       if (auto *Call = dyn_cast<CallBase>(&I)) {
         const Function *Callee = Call->getCalledFunction();
-        if (!Callee || !Intrinsic::isLeaf(Callee->getIntrinsicID()))
+        if (!Callee || !Intrinsic::isLeaf(Callee->getIntrinsicID())) {
           // Indirect calls of intrinsics are not allowed so no need to check.
           // We can be more precise here by using TargetArg returned by
           // Intrinsic::isLeaf.
+
+          if (Call->hasFnAttr(Attribute::NoCallback))
+            Node->addCalledFunction(Call, NoCallbackNode.get());
+          else
           Node->addCalledFunction(Call, CallsExternalNode.get());
-        else if (!Callee->isIntrinsic())
+        } else if (!Callee->isIntrinsic())
           Node->addCalledFunction(Call, getOrInsertFunction(Callee));
 
         // Add reference to callback functions.

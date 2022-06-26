@@ -10,8 +10,8 @@
 #ifndef _LIBCPP___FUNCTIONAL_FUNCTION_H
 #define _LIBCPP___FUNCTIONAL_FUNCTION_H
 
+#include <__assert>
 #include <__config>
-#include <__debug>
 #include <__functional/binary_function.h>
 #include <__functional/invoke.h>
 #include <__functional/unary_function.h>
@@ -22,6 +22,7 @@
 #include <__memory/shared_ptr.h>
 #include <__utility/forward.h>
 #include <__utility/move.h>
+#include <__utility/swap.h>
 #include <exception>
 #include <memory> // TODO: replace with <__memory/__builtin_new_allocator.h>
 #include <type_traits>
@@ -34,6 +35,8 @@ _LIBCPP_BEGIN_NAMESPACE_STD
 
 // bad_function_call
 
+_LIBCPP_DIAGNOSTIC_PUSH
+_LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wweak-vtables")
 class _LIBCPP_EXCEPTION_ABI bad_function_call
     : public exception
 {
@@ -51,6 +54,7 @@ public:
     virtual const char* what() const _NOEXCEPT;
 #endif
 };
+_LIBCPP_DIAGNOSTIC_POP
 
 _LIBCPP_NORETURN inline _LIBCPP_INLINE_VISIBILITY
 void __throw_bad_function_call()

@@ -72,6 +72,8 @@ bool LiveRangeEdit::checkRematerializable(VNInfo *VNI,
                                           AAResults *aa) {
   assert(DefMI && "Missing instruction");
   ScannedRemattable = true;
+  if (!EnableRemat)
+    return false;
   if (!TII.isTriviallyReMaterializable(*DefMI, aa))
     return false;
   Remattable.insert(VNI);
@@ -151,6 +153,10 @@ bool LiveRangeEdit::allUsesAvailableAt(const MachineInstr *OrigMI,
     }
   }
   return true;
+}
+
+void LiveRangeEdit::setRematEnable(bool Enable) {
+    EnableRemat = Enable;
 }
 
 bool LiveRangeEdit::canRematerializeAt(Remat &RM, VNInfo *OrigVNI,
@@ -371,7 +377,7 @@ void LiveRangeEdit::eliminateDeadDef(MachineInstr *MI, ToShrinkSet &ToShrink,
       const MachineOperand &MO = MI->getOperand(i-1);
       if (MO.isReg() && Register::isPhysicalRegister(MO.getReg()))
         continue;
-      MI->RemoveOperand(i-1);
+      MI->removeOperand(i-1);
     }
     LLVM_DEBUG(dbgs() << "Converted physregs to:\t" << *MI);
   } else {

@@ -13,15 +13,14 @@
 #ifndef LLVM_CODEGEN_MACHINEOPERAND_H
 #define LLVM_CODEGEN_MACHINEOPERAND_H
 
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/Support/DataTypes.h"
-#include "llvm/Support/LowLevelTypeImpl.h"
 #include <cassert>
 
 namespace llvm {
 
+class LLT;
 class BlockAddress;
 class Constant;
 class ConstantFP;
@@ -460,6 +459,16 @@ public:
     return !isUndef() && !isInternalRead() && (isUse() || getSubReg());
   }
 
+  /// Return true if this operand can validly be appended to an arbitrary
+  /// operand list. i.e. this behaves like an implicit operand.
+  bool isValidExcessOperand() const {
+    if ((isReg() && isImplicit()) || isRegMask())
+      return true;
+
+    // Debug operands
+    return isMetadata() || isMCSymbol();
+  }
+
   //===--------------------------------------------------------------------===//
   // Mutators for Register Operands
   //===--------------------------------------------------------------------===//
@@ -599,7 +608,7 @@ public:
   /// for ExternalSymbol operands.
   int64_t getOffset() const {
     assert((isGlobal() || isSymbol() || isMCSymbol() || isCPI() ||
-            isTargetIndex() || isBlockAddress()) &&
+            isTargetIndex() || isBlockAddress() || isFI()) &&
            "Wrong MachineOperand accessor");
     return int64_t(uint64_t(Contents.OffsetedInfo.OffsetHi) << 32) |
            SmallContents.OffsetLo;
@@ -669,7 +678,7 @@ public:
 
   void setOffset(int64_t Offset) {
     assert((isGlobal() || isSymbol() || isMCSymbol() || isCPI() ||
-            isTargetIndex() || isBlockAddress()) &&
+            isTargetIndex() || isBlockAddress() || isFI()) &&
            "Wrong MachineOperand mutator");
     SmallContents.OffsetLo = unsigned(Offset);
     Contents.OffsetedInfo.OffsetHi = int(Offset >> 32);
@@ -748,7 +757,8 @@ public:
   void ChangeToMCSymbol(MCSymbol *Sym, unsigned TargetFlags = 0);
 
   /// Replace this operand with a frame index.
-  void ChangeToFrameIndex(int Idx, unsigned TargetFlags = 0);
+  void ChangeToFrameIndex(int Idx, int64_t Offset = 0,
+                          unsigned TargetFlags = 0);
 
   /// Replace this operand with a target index.
   void ChangeToTargetIndex(unsigned Idx, int64_t Offset,
@@ -820,9 +830,10 @@ public:
     Op.setTargetFlags(TargetFlags);
     return Op;
   }
-  static MachineOperand CreateFI(int Idx) {
+  static MachineOperand CreateFI(int Idx, int64_t Offset = 0) {
     MachineOperand Op(MachineOperand::MO_FrameIndex);
     Op.setIndex(Idx);
+    Op.setOffset(Offset);
     return Op;
   }
   static MachineOperand CreateCPI(unsigned Idx, int Offset,

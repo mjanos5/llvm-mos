@@ -160,14 +160,22 @@ define float @t6(<8 x float> *%a0) {
 ; X64-SSSE3-NEXT:    orps %xmm2, %xmm0
 ; X64-SSSE3-NEXT:    retq
 ;
-; X64-AVX-LABEL: t6:
-; X64-AVX:       # %bb.0:
-; X64-AVX-NEXT:    vmovss {{.*#+}} xmm0 = mem[0],zero,zero,zero
-; X64-AVX-NEXT:    vxorps %xmm1, %xmm1, %xmm1
-; X64-AVX-NEXT:    vcmpeqss %xmm1, %xmm0, %xmm1
-; X64-AVX-NEXT:    vmovss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; X64-AVX-NEXT:    vblendvps %xmm1, %xmm2, %xmm0, %xmm0
-; X64-AVX-NEXT:    retq
+; X64-AVX1-LABEL: t6:
+; X64-AVX1:       # %bb.0:
+; X64-AVX1-NEXT:    vmovss {{.*#+}} xmm0 = mem[0],zero,zero,zero
+; X64-AVX1-NEXT:    vxorps %xmm1, %xmm1, %xmm1
+; X64-AVX1-NEXT:    vcmpeqss %xmm1, %xmm0, %xmm1
+; X64-AVX1-NEXT:    vblendvps %xmm1, {{\.?LCPI[0-9]+_[0-9]+}}(%rip), %xmm0, %xmm0
+; X64-AVX1-NEXT:    retq
+;
+; X64-AVX2-LABEL: t6:
+; X64-AVX2:       # %bb.0:
+; X64-AVX2-NEXT:    vmovss {{.*#+}} xmm0 = mem[0],zero,zero,zero
+; X64-AVX2-NEXT:    vxorps %xmm1, %xmm1, %xmm1
+; X64-AVX2-NEXT:    vcmpeqss %xmm1, %xmm0, %xmm1
+; X64-AVX2-NEXT:    vbroadcastss {{.*#+}} xmm2 = [1.0E+0,1.0E+0,1.0E+0,1.0E+0]
+; X64-AVX2-NEXT:    vblendvps %xmm1, %xmm2, %xmm0, %xmm0
+; X64-AVX2-NEXT:    retq
   %vecload = load <8 x float>, <8 x float>* %a0, align 32
   %vecext = extractelement <8 x float> %vecload, i32 1
   %cmp = fcmp oeq float %vecext, 0.000000e+00
@@ -251,14 +259,22 @@ define float @PR43971_1(<8 x float> *%a0) nounwind {
 ; X64-SSSE3-NEXT:    orps %xmm2, %xmm0
 ; X64-SSSE3-NEXT:    retq
 ;
-; X64-AVX-LABEL: PR43971_1:
-; X64-AVX:       # %bb.0: # %entry
-; X64-AVX-NEXT:    vmovss {{.*#+}} xmm0 = mem[0],zero,zero,zero
-; X64-AVX-NEXT:    vxorps %xmm1, %xmm1, %xmm1
-; X64-AVX-NEXT:    vcmpeqss %xmm1, %xmm0, %xmm1
-; X64-AVX-NEXT:    vmovss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; X64-AVX-NEXT:    vblendvps %xmm1, %xmm2, %xmm0, %xmm0
-; X64-AVX-NEXT:    retq
+; X64-AVX1-LABEL: PR43971_1:
+; X64-AVX1:       # %bb.0: # %entry
+; X64-AVX1-NEXT:    vmovss {{.*#+}} xmm0 = mem[0],zero,zero,zero
+; X64-AVX1-NEXT:    vxorps %xmm1, %xmm1, %xmm1
+; X64-AVX1-NEXT:    vcmpeqss %xmm1, %xmm0, %xmm1
+; X64-AVX1-NEXT:    vblendvps %xmm1, {{\.?LCPI[0-9]+_[0-9]+}}(%rip), %xmm0, %xmm0
+; X64-AVX1-NEXT:    retq
+;
+; X64-AVX2-LABEL: PR43971_1:
+; X64-AVX2:       # %bb.0: # %entry
+; X64-AVX2-NEXT:    vmovss {{.*#+}} xmm0 = mem[0],zero,zero,zero
+; X64-AVX2-NEXT:    vxorps %xmm1, %xmm1, %xmm1
+; X64-AVX2-NEXT:    vcmpeqss %xmm1, %xmm0, %xmm1
+; X64-AVX2-NEXT:    vbroadcastss {{.*#+}} xmm2 = [1.0E+0,1.0E+0,1.0E+0,1.0E+0]
+; X64-AVX2-NEXT:    vblendvps %xmm1, %xmm2, %xmm0, %xmm0
+; X64-AVX2-NEXT:    retq
 entry:
   %0 = load <8 x float>, <8 x float>* %a0, align 32
   %vecext = extractelement <8 x float> %0, i32 1
@@ -301,8 +317,45 @@ define void @subextract_broadcast_load_constant(<2 x i16>* nocapture %0, i16* no
   ret void
 }
 
+; A scalar load is favored over a XMM->GPR register transfer in this example.
+
 define i32 @multi_use_load_scalarization(<4 x i32>* %p) nounwind {
 ; X32-SSE2-LABEL: multi_use_load_scalarization:
+; X32-SSE2:       # %bb.0:
+; X32-SSE2-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+; X32-SSE2-NEXT:    movl (%ecx), %eax
+; X32-SSE2-NEXT:    movdqu (%ecx), %xmm0
+; X32-SSE2-NEXT:    pcmpeqd %xmm1, %xmm1
+; X32-SSE2-NEXT:    psubd %xmm1, %xmm0
+; X32-SSE2-NEXT:    movdqa %xmm0, (%ecx)
+; X32-SSE2-NEXT:    retl
+;
+; X64-SSSE3-LABEL: multi_use_load_scalarization:
+; X64-SSSE3:       # %bb.0:
+; X64-SSSE3-NEXT:    movl (%rdi), %eax
+; X64-SSSE3-NEXT:    movdqu (%rdi), %xmm0
+; X64-SSSE3-NEXT:    pcmpeqd %xmm1, %xmm1
+; X64-SSSE3-NEXT:    psubd %xmm1, %xmm0
+; X64-SSSE3-NEXT:    movdqa %xmm0, (%rdi)
+; X64-SSSE3-NEXT:    retq
+;
+; X64-AVX-LABEL: multi_use_load_scalarization:
+; X64-AVX:       # %bb.0:
+; X64-AVX-NEXT:    movl (%rdi), %eax
+; X64-AVX-NEXT:    vmovdqu (%rdi), %xmm0
+; X64-AVX-NEXT:    vpcmpeqd %xmm1, %xmm1, %xmm1
+; X64-AVX-NEXT:    vpsubd %xmm1, %xmm0, %xmm0
+; X64-AVX-NEXT:    vmovdqa %xmm0, (%rdi)
+; X64-AVX-NEXT:    retq
+  %v = load <4 x i32>, <4 x i32>* %p, align 1
+  %v1 = add <4 x i32> %v, <i32 1, i32 1, i32 1, i32 1>
+  store <4 x i32> %v1, <4 x i32>* %p
+  %r = extractelement <4 x i32> %v, i64 0
+  ret i32 %r
+}
+
+define i32 @multi_use_volatile_load_scalarization(<4 x i32>* %p) nounwind {
+; X32-SSE2-LABEL: multi_use_volatile_load_scalarization:
 ; X32-SSE2:       # %bb.0:
 ; X32-SSE2-NEXT:    movl {{[0-9]+}}(%esp), %ecx
 ; X32-SSE2-NEXT:    movdqu (%ecx), %xmm0
@@ -312,7 +365,7 @@ define i32 @multi_use_load_scalarization(<4 x i32>* %p) nounwind {
 ; X32-SSE2-NEXT:    movdqa %xmm0, (%ecx)
 ; X32-SSE2-NEXT:    retl
 ;
-; X64-SSSE3-LABEL: multi_use_load_scalarization:
+; X64-SSSE3-LABEL: multi_use_volatile_load_scalarization:
 ; X64-SSSE3:       # %bb.0:
 ; X64-SSSE3-NEXT:    movdqu (%rdi), %xmm0
 ; X64-SSSE3-NEXT:    pcmpeqd %xmm1, %xmm1
@@ -321,7 +374,7 @@ define i32 @multi_use_load_scalarization(<4 x i32>* %p) nounwind {
 ; X64-SSSE3-NEXT:    movdqa %xmm0, (%rdi)
 ; X64-SSSE3-NEXT:    retq
 ;
-; X64-AVX-LABEL: multi_use_load_scalarization:
+; X64-AVX-LABEL: multi_use_volatile_load_scalarization:
 ; X64-AVX:       # %bb.0:
 ; X64-AVX-NEXT:    vmovdqu (%rdi), %xmm0
 ; X64-AVX-NEXT:    vpcmpeqd %xmm1, %xmm1, %xmm1
@@ -329,12 +382,18 @@ define i32 @multi_use_load_scalarization(<4 x i32>* %p) nounwind {
 ; X64-AVX-NEXT:    vmovdqa %xmm1, (%rdi)
 ; X64-AVX-NEXT:    vmovd %xmm0, %eax
 ; X64-AVX-NEXT:    retq
-  %v = load <4 x i32>, <4 x i32>* %p, align 1
+  %v = load volatile <4 x i32>, <4 x i32>* %p, align 1
   %v1 = add <4 x i32> %v, <i32 1, i32 1, i32 1, i32 1>
   store <4 x i32> %v1, <4 x i32>* %p
   %r = extractelement <4 x i32> %v, i64 0
   ret i32 %r
 }
+
+; This test is reduced from a C source example that showed a miscompile:
+; https://github.com/llvm/llvm-project/issues/53695
+; The scalarized loads from 'zero' in the AVX asm must occur before
+; the vector store to 'zero' overwrites the values.
+; If compiled to a binary, this test should return 0 if correct.
 
 @n1 = local_unnamed_addr global <8 x i32> <i32 0, i32 42, i32 6, i32 0, i32 0, i32 0, i32 0, i32 0>, align 32
 @zero = internal unnamed_addr global <8 x i32> zeroinitializer, align 32
@@ -419,21 +478,21 @@ define i32 @main() nounwind {
 ; X64-AVX1-NEXT:    subq $64, %rsp
 ; X64-AVX1-NEXT:    movq n1@GOTPCREL(%rip), %rax
 ; X64-AVX1-NEXT:    vmovaps (%rax), %ymm0
-; X64-AVX1-NEXT:    vmovaps zero(%rip), %xmm1
+; X64-AVX1-NEXT:    movl zero+4(%rip), %ecx
+; X64-AVX1-NEXT:    movl zero+8(%rip), %eax
 ; X64-AVX1-NEXT:    vmovaps %ymm0, zero(%rip)
 ; X64-AVX1-NEXT:    vmovaps {{.*#+}} ymm0 = [2,2,2,2,2,2,2,2]
 ; X64-AVX1-NEXT:    vmovaps %ymm0, (%rsp)
 ; X64-AVX1-NEXT:    vmovaps (%rsp), %ymm0
-; X64-AVX1-NEXT:    vextractps $2, %xmm1, %eax
-; X64-AVX1-NEXT:    vextractps $2, %xmm0, %ecx
-; X64-AVX1-NEXT:    xorl %edx, %edx
-; X64-AVX1-NEXT:    divl %ecx
-; X64-AVX1-NEXT:    movl %eax, %ecx
-; X64-AVX1-NEXT:    vextractps $1, %xmm1, %eax
-; X64-AVX1-NEXT:    vextractps $1, %xmm0, %esi
+; X64-AVX1-NEXT:    vextractps $2, %xmm0, %esi
 ; X64-AVX1-NEXT:    xorl %edx, %edx
 ; X64-AVX1-NEXT:    divl %esi
-; X64-AVX1-NEXT:    addl %ecx, %eax
+; X64-AVX1-NEXT:    movl %eax, %esi
+; X64-AVX1-NEXT:    vextractps $1, %xmm0, %edi
+; X64-AVX1-NEXT:    movl %ecx, %eax
+; X64-AVX1-NEXT:    xorl %edx, %edx
+; X64-AVX1-NEXT:    divl %edi
+; X64-AVX1-NEXT:    addl %esi, %eax
 ; X64-AVX1-NEXT:    movq %rbp, %rsp
 ; X64-AVX1-NEXT:    popq %rbp
 ; X64-AVX1-NEXT:    vzeroupper
@@ -447,21 +506,21 @@ define i32 @main() nounwind {
 ; X64-AVX2-NEXT:    subq $64, %rsp
 ; X64-AVX2-NEXT:    movq n1@GOTPCREL(%rip), %rax
 ; X64-AVX2-NEXT:    vmovaps (%rax), %ymm0
-; X64-AVX2-NEXT:    vmovaps zero(%rip), %xmm1
+; X64-AVX2-NEXT:    movl zero+4(%rip), %ecx
+; X64-AVX2-NEXT:    movl zero+8(%rip), %eax
 ; X64-AVX2-NEXT:    vmovaps %ymm0, zero(%rip)
 ; X64-AVX2-NEXT:    vbroadcastss {{.*#+}} ymm0 = [2,2,2,2,2,2,2,2]
 ; X64-AVX2-NEXT:    vmovaps %ymm0, (%rsp)
 ; X64-AVX2-NEXT:    vmovaps (%rsp), %ymm0
-; X64-AVX2-NEXT:    vextractps $2, %xmm1, %eax
-; X64-AVX2-NEXT:    vextractps $2, %xmm0, %ecx
-; X64-AVX2-NEXT:    xorl %edx, %edx
-; X64-AVX2-NEXT:    divl %ecx
-; X64-AVX2-NEXT:    movl %eax, %ecx
-; X64-AVX2-NEXT:    vextractps $1, %xmm1, %eax
-; X64-AVX2-NEXT:    vextractps $1, %xmm0, %esi
+; X64-AVX2-NEXT:    vextractps $2, %xmm0, %esi
 ; X64-AVX2-NEXT:    xorl %edx, %edx
 ; X64-AVX2-NEXT:    divl %esi
-; X64-AVX2-NEXT:    addl %ecx, %eax
+; X64-AVX2-NEXT:    movl %eax, %esi
+; X64-AVX2-NEXT:    vextractps $1, %xmm0, %edi
+; X64-AVX2-NEXT:    movl %ecx, %eax
+; X64-AVX2-NEXT:    xorl %edx, %edx
+; X64-AVX2-NEXT:    divl %edi
+; X64-AVX2-NEXT:    addl %esi, %eax
 ; X64-AVX2-NEXT:    movq %rbp, %rsp
 ; X64-AVX2-NEXT:    popq %rbp
 ; X64-AVX2-NEXT:    vzeroupper

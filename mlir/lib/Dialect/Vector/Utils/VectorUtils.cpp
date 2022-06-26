@@ -15,8 +15,8 @@
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
@@ -283,7 +283,7 @@ bool matcher::operatesOnSuperVectorsOf(Operation &op,
     superVectorType = transfer.getVectorType();
     mustDivide = true;
   } else if (op.getNumResults() == 0) {
-    if (!isa<ReturnOp>(op)) {
+    if (!isa<func::ReturnOp>(op)) {
       op.emitError("NYI: assuming only return operations can have 0 "
                    " results at this point");
     }
@@ -306,7 +306,7 @@ bool matcher::operatesOnSuperVectorsOf(Operation &op,
   auto ratio = shapeRatio(superVectorType, subVectorType);
 
   // Sanity check.
-  assert((ratio.hasValue() || !mustDivide) &&
+  assert((ratio || !mustDivide) &&
          "vector.transfer operation in which super-vector size is not an"
          " integer multiple of sub-vector size");
 

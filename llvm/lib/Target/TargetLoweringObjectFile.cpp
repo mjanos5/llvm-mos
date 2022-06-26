@@ -24,10 +24,8 @@
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCStreamer.h"
-#include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/SectionKind.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 using namespace llvm;
@@ -96,6 +94,33 @@ static bool isSuitableForBSS(const GlobalVariable *GV) {
     return false;
 
   // Otherwise, put it in BSS!
+  return true;
+}
+
+static bool isUndef(const Constant *C) {
+  if (isa<UndefValue>(C))
+    return true;
+  if (!isa<ConstantAggregate>(C))
+    return false;
+  for (auto Operand : C->operand_values()) {
+    if (!isUndef(cast<Constant>(Operand)))
+      return false;
+  }
+  return true;
+}
+
+static bool isSuitableForNoInit(const GlobalVariable *GV) {
+  const Constant *C = GV->getInitializer();
+
+  // Must have an undef initializer.
+  if (!isUndef(C))
+    return false;
+
+  // If the global has an explicit section specified, don't put it in BSS.
+  if (GV->hasSection())
+    return false;
+
+  // Otherwise, put it in NoInit!
   return true;
 }
 
@@ -231,6 +256,9 @@ SectionKind TargetLoweringObjectFile::getKindForGlobal(const GlobalObject *GO,
   // Variables with common linkage always get classified as common.
   if (GVar->hasCommonLinkage())
     return SectionKind::getCommon();
+
+  if (isSuitableForNoInit(GVar) && TM.hasNoInitSection())
+    return SectionKind::getNoInit();
 
   // Most non-mergeable zero data can be put in the BSS section unless otherwise
   // specified.

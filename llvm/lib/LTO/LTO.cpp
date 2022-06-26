@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #include "llvm/LTO/LTO.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallSet.h"
@@ -134,7 +135,6 @@ void llvm::computeLTOCacheKey(
   AddUnsigned(Conf.CGOptLevel);
   AddUnsigned(Conf.CGFileType);
   AddUnsigned(Conf.OptLevel);
-  AddUnsigned(Conf.UseNewPM);
   AddUnsigned(Conf.Freestanding);
   AddString(Conf.OptPipeline);
   AddString(Conf.AAPipeline);
@@ -640,7 +640,7 @@ Error LTO::addModule(InputFile &Input, unsigned ModI,
   if (!LTOInfo)
     return LTOInfo.takeError();
 
-  if (EnableSplitLTOUnit.hasValue()) {
+  if (EnableSplitLTOUnit) {
     // If only some modules were split, flag this in the index so that
     // we can skip or error on optimizations that need consistently split
     // modules (whole program devirt and lower type tests).
@@ -820,9 +820,10 @@ LTO::addRegularLTO(BitcodeModule BM, ArrayRef<InputFile::Symbol> Syms,
       // For now they aren't reported correctly by ModuleSymbolTable.
       auto &CommonRes = RegularLTO.Commons[std::string(Sym.getIRName())];
       CommonRes.Size = std::max(CommonRes.Size, Sym.getCommonSize());
-      MaybeAlign SymAlign(Sym.getCommonAlignment());
-      if (SymAlign)
-        CommonRes.Align = max(*SymAlign, CommonRes.Align);
+      if (uint32_t SymAlignValue = Sym.getCommonAlignment()) {
+        const Align SymAlign(SymAlignValue);
+        CommonRes.Align = std::max(SymAlign, CommonRes.Align.valueOrOne());
+      }
       CommonRes.Prevailing |= Res.Prevailing;
     }
   }
@@ -885,8 +886,7 @@ Error LTO::linkRegularLTO(RegularLTOState::AddedModule Mod,
     Keep.push_back(GV);
   }
 
-  return RegularLTO.Mover->move(std::move(Mod.M), Keep,
-                                [](GlobalValue &, IRMover::ValueAdder) {},
+  return RegularLTO.Mover->move(std::move(Mod.M), Keep, nullptr,
                                 /* IsPerformingImport */ false);
 }
 
@@ -1150,6 +1150,17 @@ static const char *libcallRoutineNames[] = {
 #define HANDLE_LIBCALL(code, name) name,
 #include "llvm/IR/RuntimeLibcalls.def"
 #undef HANDLE_LIBCALL
+  // Needed by MOS target.
+  "__memset",
+  "__udivmodqi4",
+  "__udivmodhi4",
+  "__udivmodsi4",
+  "__udivmoddi4",
+  "__divmodqi4",
+  "__divmodhi4",
+  "__divmodsi4",
+  "__divmoddi4",
+  "abort",
 };
 
 ArrayRef<const char*> LTO::getRuntimeLibcallSymbols() {

@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/Basic/SourceManager.h"
@@ -175,17 +176,22 @@ static Attr *handleLoopHintAttr(Sema &S, Stmt *St, const ParsedAttr &A,
 
 namespace {
 class CallExprFinder : public ConstEvaluatedExprVisitor<CallExprFinder> {
-  bool FoundCallExpr = false;
+  bool FoundAsmStmt = false;
+  std::vector<const CallExpr *> CallExprs;
 
 public:
   typedef ConstEvaluatedExprVisitor<CallExprFinder> Inherited;
 
   CallExprFinder(Sema &S, const Stmt *St) : Inherited(S.Context) { Visit(St); }
 
-  bool foundCallExpr() { return FoundCallExpr; }
+  bool foundCallExpr() { return !CallExprs.empty(); }
+  const std::vector<const CallExpr *> &getCallExprs() { return CallExprs; }
 
-  void VisitCallExpr(const CallExpr *E) { FoundCallExpr = true; }
-  void VisitAsmStmt(const AsmStmt *S) { FoundCallExpr = true; }
+  bool foundAsmStmt() { return FoundAsmStmt; }
+
+  void VisitCallExpr(const CallExpr *E) { CallExprs.push_back(E); }
+
+  void VisitAsmStmt(const AsmStmt *S) { FoundAsmStmt = true; }
 
   void Visit(const Stmt *St) {
     if (!St)
@@ -200,13 +206,65 @@ static Attr *handleNoMergeAttr(Sema &S, Stmt *St, const ParsedAttr &A,
   NoMergeAttr NMA(S.Context, A);
   CallExprFinder CEF(S, St);
 
-  if (!CEF.foundCallExpr()) {
-    S.Diag(St->getBeginLoc(), diag::warn_nomerge_attribute_ignored_in_stmt)
+  if (!CEF.foundCallExpr() && !CEF.foundAsmStmt()) {
+    S.Diag(St->getBeginLoc(), diag::warn_attribute_ignored_no_calls_in_stmt)
         << A;
     return nullptr;
   }
 
   return ::new (S.Context) NoMergeAttr(S.Context, A);
+}
+
+static Attr *handleNoInlineAttr(Sema &S, Stmt *St, const ParsedAttr &A,
+                                SourceRange Range) {
+  NoInlineAttr NIA(S.Context, A);
+  if (!NIA.isClangNoInline()) {
+    S.Diag(St->getBeginLoc(), diag::warn_function_attribute_ignored_in_stmt)
+        << "[[clang::noinline]]";
+    return nullptr;
+  }
+
+  CallExprFinder CEF(S, St);
+  if (!CEF.foundCallExpr()) {
+    S.Diag(St->getBeginLoc(), diag::warn_attribute_ignored_no_calls_in_stmt)
+        << A;
+    return nullptr;
+  }
+
+  for (const auto *CallExpr : CEF.getCallExprs()) {
+    const Decl *Decl = CallExpr->getCalleeDecl();
+    if (Decl->hasAttr<AlwaysInlineAttr>() || Decl->hasAttr<FlattenAttr>())
+      S.Diag(St->getBeginLoc(), diag::warn_function_stmt_attribute_precedence)
+          << A << (Decl->hasAttr<AlwaysInlineAttr>() ? 0 : 1);
+  }
+
+  return ::new (S.Context) NoInlineAttr(S.Context, A);
+}
+
+static Attr *handleAlwaysInlineAttr(Sema &S, Stmt *St, const ParsedAttr &A,
+                                    SourceRange Range) {
+  AlwaysInlineAttr AIA(S.Context, A);
+  if (!AIA.isClangAlwaysInline()) {
+    S.Diag(St->getBeginLoc(), diag::warn_function_attribute_ignored_in_stmt)
+        << "[[clang::always_inline]]";
+    return nullptr;
+  }
+
+  CallExprFinder CEF(S, St);
+  if (!CEF.foundCallExpr()) {
+    S.Diag(St->getBeginLoc(), diag::warn_attribute_ignored_no_calls_in_stmt)
+        << A;
+    return nullptr;
+  }
+
+  for (const auto *CallExpr : CEF.getCallExprs()) {
+    const Decl *Decl = CallExpr->getCalleeDecl();
+    if (Decl->hasAttr<NoInlineAttr>() || Decl->hasAttr<FlattenAttr>())
+      S.Diag(St->getBeginLoc(), diag::warn_function_stmt_attribute_precedence)
+          << A << (Decl->hasAttr<NoInlineAttr>() ? 2 : 1);
+  }
+
+  return ::new (S.Context) AlwaysInlineAttr(S.Context, A);
 }
 
 static Attr *handleMustTailAttr(Sema &S, Stmt *St, const ParsedAttr &A,
@@ -231,6 +289,15 @@ static Attr *handleUnlikely(Sema &S, Stmt *St, const ParsedAttr &A,
     S.Diag(A.getLoc(), diag::ext_cxx20_attr) << A << Range;
 
   return ::new (S.Context) UnlikelyAttr(S.Context, A);
+}
+
+static Attr *handleLeaf(Sema &S, Stmt *St, const ParsedAttr &A,
+                            SourceRange Range) {
+
+  if (!S.getLangOpts().CPlusPlus20 && A.isCXX11Attribute() && !A.getScopeName())
+    S.Diag(A.getLoc(), diag::ext_cxx20_attr) << A << Range;
+
+  return ::new (S.Context) LeafAttr(S.Context, A);
 }
 
 #define WANT_STMT_MERGE_LOGIC
@@ -408,6 +475,8 @@ static Attr *ProcessStmtAttribute(Sema &S, Stmt *St, const ParsedAttr &A,
     return nullptr;
 
   switch (A.getKind()) {
+  case ParsedAttr::AT_AlwaysInline:
+    return handleAlwaysInlineAttr(S, St, A, Range);
   case ParsedAttr::AT_FallThrough:
     return handleFallThroughAttr(S, St, A, Range);
   case ParsedAttr::AT_LoopHint:
@@ -418,12 +487,16 @@ static Attr *ProcessStmtAttribute(Sema &S, Stmt *St, const ParsedAttr &A,
     return handleSuppressAttr(S, St, A, Range);
   case ParsedAttr::AT_NoMerge:
     return handleNoMergeAttr(S, St, A, Range);
+  case ParsedAttr::AT_NoInline:
+    return handleNoInlineAttr(S, St, A, Range);
   case ParsedAttr::AT_MustTail:
     return handleMustTailAttr(S, St, A, Range);
   case ParsedAttr::AT_Likely:
     return handleLikely(S, St, A, Range);
   case ParsedAttr::AT_Unlikely:
     return handleUnlikely(S, St, A, Range);
+  case ParsedAttr::AT_Leaf:
+    return handleLeaf(S, St, A, Range);
   default:
     // N.B., ClangAttrEmitter.cpp emits a diagnostic helper that ensures a
     // declaration attribute is not written on a statement, but this code is
@@ -434,8 +507,7 @@ static Attr *ProcessStmtAttribute(Sema &S, Stmt *St, const ParsedAttr &A,
   }
 }
 
-void Sema::ProcessStmtAttributes(Stmt *S,
-                                 const ParsedAttributesWithRange &InAttrs,
+void Sema::ProcessStmtAttributes(Stmt *S, const ParsedAttributes &InAttrs,
                                  SmallVectorImpl<const Attr *> &OutAttrs) {
   for (const ParsedAttr &AL : InAttrs) {
     if (const Attr *A = ProcessStmtAttribute(*this, S, AL, InAttrs.Range))
