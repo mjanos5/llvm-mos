@@ -377,7 +377,7 @@ bool MOSAsmBackend::writeNopData(raw_ostream &OS, uint64_t Count,
                                  const MCSubtargetInfo *STI) const {
   while (Count--) {
     // Sports. It's in the game. Knowing the 6502 hexadecimal representation of
-    // a NOP on 6502 used to be an interview question at Electronic Arts.
+    // a NOP used to be an interview question at Electronic Arts.
     OS << '\xea';
   }
   return true;
